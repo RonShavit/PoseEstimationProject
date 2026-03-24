@@ -5,6 +5,7 @@ from OpenGL.GLU import *
 import trimap_beta as tm
 import math
 from tqdm import tqdm
+import cv2
 
 # --- Resize function (like ReSizeGLScene) ---
 def resize(width, height):
@@ -47,13 +48,13 @@ def draw():
     keys_pressed = pygame.key.get_pressed()
     
     if keys_pressed[K_LEFT]:
-        r_y -= 0.1
+        r_y -= 1
     if keys_pressed[K_RIGHT]:
-        r_y += 0.1
+        r_y += 1
     if keys_pressed[K_DOWN]:
-        r_x += 0.1
+        r_x += 1
     if keys_pressed[K_UP]:
-        r_x -= 0.1
+        r_x -= 1
     if keys_pressed[K_a]:
         c_x += rx * r_speed
         c_z += rz * r_speed
@@ -83,13 +84,17 @@ def draw():
     glRotatef(r_x, rx, 0, rz )
     glRotatef(r_z , rz, 0, rx)
     glTranslatef(c_x, c_y, c_z)
-    
+    image = cv2.imread("map_1.jpg")
     for tri in tqdm(tm.read_tri_map("test2.tri")):
         glBegin(GL_TRIANGLES)
-        
-        glColor3f(1, 0, 0)  # red color
+        xcolor = image[int(tri.v1.y), int(tri.v1.x)]
+        glColor3f(xcolor[0]/255, xcolor[1]/255, xcolor[2]/255)  # red color
         glVertex3f(tri.v1.x, tri.v1.y, tri.v1.z)
+        xcolor = image[int(tri.v2.y), int(tri.v2.x)]
+        glColor3f(xcolor[0]/255, xcolor[1]/255, xcolor[2]/255)  # red color
         glVertex3f(tri.v2.x, tri.v2.y, tri.v2.z)
+        xcolor = image[int(tri.v3.y), int(tri.v3.x)]
+        glColor3f(xcolor[0]/255, xcolor[1]/255, xcolor[2]/255)  # red color
         glVertex3f(tri.v3.x, tri.v3.y, tri.v3.z)
         glEnd()
 

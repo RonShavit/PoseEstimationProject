@@ -65,10 +65,10 @@ def build_triangles(samples, width, height, margin):
 
     return triangles
 
-samp = sample_pixels("map_1.jpg", 64)
+samp = sample_pixels("map_1.jpg", 10)
 image = cv2.imread("map_1.jpg")
 height, width, _ = image.shape
-tris = build_triangles(samp, width, height, 64)  # Replace 640 and 480 with actual image dimensions
+tris = build_triangles(samp, width, height, 10)  # Replace 640 and 480 with actual image dimensions
 with open("test2.tri", 'w') as f:
     for i, (x, y, r) in enumerate(samp):
         f.write(f"{x},{y},{r}\n")
