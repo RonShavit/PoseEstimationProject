@@ -57,6 +57,39 @@ def draw_gradient_background():
     glVertex2f(-1, -1)
 
     glEnd()
+    
+
+
+    # Restore state
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    
+
+
+    glEnable(GL_DEPTH_TEST)
+
+def draw_seperator_line():
+    width, height = pygame.display.get_surface().get_size()
+    glDisable(GL_DEPTH_TEST)  # draw in background
+
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(-1, 1, -1, 1, -1, 1)
+
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+
+    glViewport(0, 0, width, height)
+    glBegin(GL_LINES)
+    glColor3f(0, 0, 0)
+    glVertex2f(0, -height)
+    glVertex2f(0, height)
+    glEnd()
 
     # Restore state
     glPopMatrix()
@@ -64,7 +97,6 @@ def draw_gradient_background():
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
 
-    glEnable(GL_DEPTH_TEST)
 
 # --- DrawGLScene ---
 def render_scene(apply_input=True):
@@ -142,6 +174,8 @@ def draw():
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
     width, height = pygame.display.get_surface().get_size()
+    
+
 
     # --- LEFT VIEW (NORMAL CAMERA) ---
     glViewport(0, 0, width // 2, height)
@@ -177,6 +211,10 @@ def draw():
 
     # Restore original camera
     c_x, c_y, c_z, r_x, r_y, r_z = old_cam
+    
+    draw_seperator_line()
+    
+
 
     pygame.display.flip()
 # --- Main ---
@@ -214,6 +252,7 @@ def main():
                     pygame.display.toggle_fullscreen()
                 if event.key == K_b:
                     c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = c_x, c_y,c_z,r_x,r_y,r_z
+                    print(f"Saved position ({c_x},{c_y},{c_z}) with rotation ({r_x},{r_y},{r_z})")
 
             if event.type == VIDEORESIZE:
                 resize(event.w, event.h)
