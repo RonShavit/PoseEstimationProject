@@ -1,5 +1,6 @@
 import cv2
 import trimap_beta as tm
+from read_config import read_config
 
 def sample_pixels(image_path, margin):
     # Load image
@@ -19,7 +20,7 @@ def sample_pixels(image_path, margin):
     for y in range(0, height, margin):
         for x in range(0, width, margin):
             r = int(gray[y, x])/255.0  # grayscale value (0–255)
-            samples.append((x, y, r))
+            samples.append((x/margin, r, y /margin))
 
     return samples
 
@@ -65,10 +66,11 @@ def build_triangles(samples, width, height, margin):
 
     return triangles
 
-samp = sample_pixels("map_1.jpg", 10)
-image = cv2.imread("map_1.jpg")
+configs = read_config()
+samp = sample_pixels(configs.get("map_path"), configs.get("margin"))
+image = cv2.imread(configs.get("map_path"))
 height, width, _ = image.shape
-tris = build_triangles(samp, width, height, 10)  # Replace 640 and 480 with actual image dimensions
+tris = build_triangles(samp, width, height, configs.get("margin"))
 with open("test2.tri", 'w') as f:
     for i, (x, y, r) in enumerate(samp):
         f.write(f"{x},{y},{r}\n")
