@@ -160,6 +160,9 @@ def main():
 
     resize(*display)
     init()
+    print(glGetString(GL_RENDERER))
+    print(glGetString(GL_VENDOR))
+    print(glGetString(GL_VERSION))
 
     running = True
 
@@ -187,4 +190,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
