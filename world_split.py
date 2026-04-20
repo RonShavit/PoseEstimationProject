@@ -97,7 +97,27 @@ def draw_seperator_line():
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
 
+def get_world_coords(mouse_x, mouse_y):
+    # Get viewport
+    viewport = glGetIntegerv(GL_VIEWPORT)
 
+    # Flip Y (OpenGL origin is bottom-left)
+    real_y = viewport[3] - mouse_y
+
+    # Read depth at mouse position
+    depth = glReadPixels(mouse_x, real_y, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT)
+
+    # Get matrices
+    modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+    projection = glGetDoublev(GL_PROJECTION_MATRIX)
+
+    # Convert to world coords
+    world_x, world_y, world_z = gluUnProject(
+        mouse_x, real_y, depth[0][0],
+        modelview, projection, viewport
+    )
+
+    return world_x, world_y, world_z
 # --- DrawGLScene ---
 def render_scene(apply_input=True, recording_mode=True):
     global CONFIG
@@ -105,6 +125,7 @@ def render_scene(apply_input=True, recording_mode=True):
     global r_x, r_y, r_z
     global c_x2, c_y2, c_z2
     global r_x2, r_y2, r_z2
+    global picking_mode
 
     r_speed = 1
     margin = CONFIG.get("margin")
@@ -115,7 +136,7 @@ def render_scene(apply_input=True, recording_mode=True):
     rz = math.sin(r_y * math.pi / 180)
 
     # --- INPUT ONLY FOR LEFT VIEW ---
-    if apply_input:
+    if apply_input and not picking_mode:
         keys_pressed = pygame.key.get_pressed()
         if recording_mode:
 
@@ -154,11 +175,12 @@ def render_scene(apply_input=True, recording_mode=True):
         else: #replaying mode
             global saved_positions
             global recording_index
+            global picked_points
             
 
 
             c_x, c_y, c_z, r_x, r_y, r_z = saved_positions[recording_index]
-    else:        # Fixed camera for right view
+    elif not apply_input and not picking_mode:        # Fixed camera for right view
         c_x, c_y, c_z = c_x2, c_y2, c_z2
         r_x, r_y, r_z = r_x2, r_y2, r_z2
         for pos in saved_positions:
@@ -180,6 +202,28 @@ def render_scene(apply_input=True, recording_mode=True):
 
             glPopMatrix()
 
+    elif not apply_input and picking_mode:
+        c_x, c_y, c_z = c_x2, c_y2, c_z2
+        r_x, r_y, r_z = r_x2, r_y2, r_z2
+        for pos in picked_points:
+            px, py, pz = pos
+
+            glPushMatrix()
+
+    # --- UNDO current camera transform ---
+            glLoadIdentity()
+
+    # Apply the SAME camera as the right view (fixed camera)
+            glRotatef(r_y2, 0, 1, 0)
+            glRotatef(r_x2, 1, 0, 0)
+            glRotatef(r_z2, 0, 0, 1)
+            glTranslatef(c_x2, c_y2, c_z2)
+
+    # --- NOW draw pyramid in world space ---
+            draw_sphere(px, py, pz)
+
+            glPopMatrix()
+    
     # --- APPLY CAMERA ---
     glLoadIdentity()
     glRotatef(r_y, 0, 1, 0)
@@ -199,7 +243,14 @@ def render_scene(apply_input=True, recording_mode=True):
             glVertex3f(v.x, v.y, v.z)
 
         glEnd()
-
+def draw_sphere(x,y,z):
+    glPushMatrix()
+    glTranslatef((x-8)*2,y,z) #TODO tweek numbers
+    quad = gluNewQuadric()
+    gluSphere(quad, 0.3, 32, 4)
+    gluDeleteQuadric(quad)
+    glPopMatrix()
+    
 def draw_camera_pyramid(x, y, z, rx, ry, rz, scale=0.3):
     global recording_index
     global recording_mode
@@ -255,6 +306,7 @@ def draw_camera_pyramid(x, y, z, rx, ry, rz, scale=0.3):
     glPopMatrix()
 
 def draw(recording_mode):
+    global picking_mode
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
     width, height = pygame.display.get_surface().get_size()
@@ -313,7 +365,11 @@ def main():
     global saved_positions
     global recording_index
     global recording_mode
+    global picking_mode
+    global picked_points
+    picking_mode = False
     saved_positions = []
+    picked_points = []
     recording_mode = True
     starting_pos = CONFIG.get("start_pos").split(",")
     c_x2, c_y2, c_z2 = map(float, starting_pos)
@@ -348,6 +404,10 @@ def main():
                     recording_index = 0
                     recording_mode = not recording_mode if saved_positions else recording_mode
                     print(f"Recording mode: {recording_mode}")
+                
+                if event.key == K_p:
+                    picking_mode = not picking_mode
+                    print("picking mode", "on" if picking_mode else "off")
                     
                 if event.key == K_LEFT and not recording_mode:
                     recording_index = (recording_index-1)% len(saved_positions)
@@ -356,6 +416,13 @@ def main():
 
             if event.type == VIDEORESIZE:
                 resize(event.w, event.h)
+                
+            if event.type == MOUSEBUTTONDOWN:
+                if picking_mode and event.button == 1:
+                    if event.pos[0]>=640:
+                        picked_points.append(get_world_coords(event.pos[0],event.pos[1]))
+                        print(picked_points[-1])
+                        
                 
 
                 
