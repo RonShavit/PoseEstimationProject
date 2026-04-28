@@ -97,15 +97,39 @@ def draw_seperator_line():
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
 
+def setup_right_view_matrices(width, height):
+    """Match the projection/modelview used by the right global view."""
+    glViewport(width // 2, 0, width // 2, height)
+
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(45, (width / 2) / height, 0.1, 100.0)
+
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+    glRotatef(r_y2, 0, 1, 0)
+    glRotatef(r_x2, 1, 0, 0)
+    glRotatef(r_z2, 0, 0, 1)
+    glTranslatef(c_x2, c_y2, c_z2)
+
+
 def get_world_coords(mouse_x, mouse_y):
+    width, height = pygame.display.get_surface().get_size()
+    setup_right_view_matrices(width, height)
+
     # Get viewport
     viewport = glGetIntegerv(GL_VIEWPORT)
 
     # Flip Y (OpenGL origin is bottom-left)
-    real_y = viewport[3] - mouse_y
+    real_y = height - mouse_y
 
     # Read depth at mouse position
     depth = glReadPixels(mouse_x, real_y, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT)
+    depth_value = depth[0][0]
+
+    # Depth 1.0 means the click hit the far plane/background, not the terrain.
+    if depth_value >= 1.0:
+        return None
 
     # Get matrices
     modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
@@ -113,7 +137,7 @@ def get_world_coords(mouse_x, mouse_y):
 
     # Convert to world coords
     world_x, world_y, world_z = gluUnProject(
-        mouse_x, real_y, depth[0][0],
+        mouse_x, real_y, depth_value,
         modelview, projection, viewport
     )
 
@@ -245,7 +269,8 @@ def render_scene(apply_input=True, recording_mode=True):
         glEnd()
 def draw_sphere(x,y,z):
     glPushMatrix()
-    glTranslatef((x-8)*2,y,z) #TODO tweek numbers
+    glTranslatef(x,y,z)
+    glColor3f(1, 0, 0)
     quad = gluNewQuadric()
     gluSphere(quad, 0.3, 32, 4)
     gluDeleteQuadric(quad)
@@ -367,9 +392,11 @@ def main():
     global recording_mode
     global picking_mode
     global picked_points
+    global picked_correspondences
     picking_mode = False
     saved_positions = []
     picked_points = []
+    picked_correspondences = []
     recording_mode = True
     starting_pos = CONFIG.get("start_pos").split(",")
     c_x2, c_y2, c_z2 = map(float, starting_pos)
@@ -419,9 +446,16 @@ def main():
                 
             if event.type == MOUSEBUTTONDOWN:
                 if picking_mode and event.button == 1:
-                    if event.pos[0]>=640:
-                        picked_points.append(get_world_coords(event.pos[0],event.pos[1]))
-                        print(picked_points[-1])
+                    width, height = pygame.display.get_surface().get_size()
+                    if event.pos[0] >= width // 2:
+                        world_point = get_world_coords(event.pos[0], event.pos[1])
+                        if world_point is not None:
+                            image_point = (event.pos[0] - width // 2, event.pos[1])
+                            picked_points.append(world_point)
+                            picked_correspondences.append((image_point, world_point))
+                            print(f"Picked 2D {image_point} -> 3D {world_point}")
+                        else:
+                            print("Picking missed terrain")
                         
                 
 
