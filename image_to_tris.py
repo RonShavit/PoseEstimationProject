@@ -1,4 +1,7 @@
+from email.mime import image
+
 import cv2
+from matplotlib import image
 import trimap_beta as tm
 from read_config import read_config
 
@@ -19,7 +22,7 @@ def sample_pixels(image_path, margin):
     # Iterate with step = margin
     for y in range(0, height, margin):
         for x in range(0, width, margin):
-            r = int(gray[y, x])/255.0 * 3  # grayscale value (0–255)
+            r = int(gray[y, x])/255.0 * 10  # grayscale value (0–255)
             samples.append((x/margin, r, y /margin))
 
     return samples
@@ -65,15 +68,17 @@ def build_triangles(samples, width, height, margin):
             triangles.append((i1, i3, i2))
 
     return triangles
-
-configs = read_config()
-samp = sample_pixels(configs.get("map_path"), configs.get("margin"))
-image = cv2.imread(configs.get("map_path"))
-height, width, _ = image.shape
-tris = build_triangles(samp, width, height, configs.get("margin"))
-with open("test2.tri", 'w') as f:
-    for i, (x, y, r) in enumerate(samp):
-        f.write(f"{x},{y},{r}\n")
+def main():
+    configs = read_config()
+    samp = sample_pixels(configs.get("map_path"), configs.get("margin"))
+    image = cv2.imread(configs.get("map_path"))
+    height, width, _ = image.shape
+    tris = build_triangles(samp, width, height, configs.get("margin"))
+    with open("test2.tri", 'w') as f:
+        for i, (x, y, r) in enumerate(samp):
+            f.write(f"{x},{y},{r}\n")
     
-    for i in tris:
-        f.write(f"v{i[0]},v{i[1]},v{i[2]}\n")
+        for i in tris:
+            f.write(f"v{i[0]},v{i[1]},v{i[2]}\n")
+if __name__ == "__main__":
+    main()
