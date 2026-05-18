@@ -346,7 +346,7 @@ def solve_pnp(picked_correspondences, view_w, view_h):
     rot_error += min(abs(euler[1]+r_y2), 360-abs(euler[1]+r_y2))
     rot_error += min(abs(euler[2]+r_z2), 360-abs(euler[2]+r_z2))
     print(f"PnP position error vs actual camera: {pos_error} units")
-    print(f"PnP rotation error vs actual camera: {rot_error%360} degrees")
+    print(f"PnP rotation error vs actual camera: {min(rot_error%360, 360-rot_error%360)} degrees")
     return True, cam_pos, euler, R, tvec
 
 
@@ -698,7 +698,19 @@ def main():
                     print(f"Recording mode: {recording_mode}")
                 if event.key == K_p:
                     picking_mode = not picking_mode
-                    if not picking_mode:
+                    if picking_mode:
+                        # Snap right view to last saved position (or starting pos if none)
+                        if saved_positions:
+                            c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = saved_positions[-1]
+                            print(f"Picking mode: right view set to last saved pos ({c_x2:.1f},{c_y2:.1f},{c_z2:.1f})")
+                        else:
+                            image = cv2.imread(CONFIG.get("map_path"))
+                            ih, iw, _ = image.shape
+                            m = CONFIG.get("margin")
+                            c_x2, c_y2, c_z2 = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
+                            r_x2, r_y2, r_z2 = 30.0, 0.0, 0.0
+                            print("Picking mode: no saved positions, right view at starting pos")
+                    else:
                         pnp_result = None      # clear overlay when leaving picking mode
                     print("picking mode", "on" if picking_mode else "off")
                 if event.key == K_c and picking_mode:
