@@ -78,7 +78,9 @@ def draw_pyramid_vbo(vbo, vertex_count, tint):
 # ---------------------------------------------------------------------------
 # Terrain VBO
 # ---------------------------------------------------------------------------
-def build_terrain_vbo(tri_path, image, margin):
+def build_terrain_vbo(tri_path, image, margin, color_image = None):
+    if color_image is None:
+        color_image = image
     import image_to_tris
     image_to_tris.main()
     tris = list(tm.read_tri_map(tri_path))
@@ -87,7 +89,7 @@ def build_terrain_vbo(tri_path, image, margin):
     idx = 0
     for tri in tris:
         for v in (tri.v1, tri.v2, tri.v3):
-            bgr = image[int(v.z) * margin, int(v.x) * margin]
+            bgr = color_image[int(v.z) * margin, int(v.x) * margin]
             data[idx]   = bgr[2] / 255.0
             data[idx+1] = bgr[1] / 255.0
             data[idx+2] = bgr[0] / 255.0
@@ -502,7 +504,7 @@ def draw_sphere(x, y, z):
     glPushMatrix()
     glTranslatef(x, y, z)
     glColor3f(1, 0, 0)
-    gluSphere(get_sphere_quadric(), 0.3, 16, 8)
+    gluSphere(get_sphere_quadric(), 1, 16, 8)
     glPopMatrix()
 
 
@@ -511,7 +513,7 @@ def draw_tracker_sphere(x, y, z, r, g, b):
     glPushMatrix()
     glTranslatef(x, y, z)
     glColor3f(r / 255.0, g / 255.0, b / 255.0)
-    gluSphere(get_sphere_quadric(), 5, 24, 12)
+    gluSphere(get_sphere_quadric(), 2, 24, 12)
     glPopMatrix()
 
 
@@ -566,7 +568,7 @@ def render_scene(apply_input=True, recording_mode=True):
                 img = cv2.imread(CONFIG.get("map_path"))
                 ih, iw, _ = img.shape
                 m = CONFIG.get("margin")
-                c_x, c_y, c_z = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
+                c_x, c_y, c_z = -iw/m/2, float(CONFIG.get("start_h")), -(ih/m)-100
                 r_x, r_y, r_z = 30, 0.0, 0.0
         else:
             global saved_positions, recording_index, picked_points
@@ -613,9 +615,17 @@ def render_scene(apply_input=True, recording_mode=True):
 # Trackers mode screenshot helper
 # ---------------------------------------------------------------------------
 def save_left_screenshot():
-    """Capture the left viewport from the OpenGL framebuffer and save as screenshot.png."""
+    """
+    Capture the left viewport, save as screenshot.png, find tracker colour blobs,
+    build correspondences, run PnP, and store result in tracker_pnp_result so the
+    right-view overlay shows the estimated pose when trackers mode is active.
+    """
+    global tracker_pnp_result, tracker_correspondences, trackers_list
+
     width, height = pygame.display.get_surface().get_size()
     half_w = width // 2
+
+    # --- Capture left framebuffer ---
     pixels = glReadPixels(0, 0, half_w, height, GL_RGB, GL_UNSIGNED_BYTE)
     img = np.frombuffer(pixels, dtype=np.uint8).reshape(height, half_w, 3)
     img = np.flipud(img)                          # OpenGL bottom-left → top-left
@@ -623,11 +633,34 @@ def save_left_screenshot():
     path = "screenshot.png"
     cv2.imwrite(path, img)
     print(f"Screenshot saved to {path}  ({half_w}x{height})")
-    tracker_colors = []
-    for x,y,z,r,g,b in trackers_list:
-        tracker_colors.append((r, g, b))
-    color_blob_centers = find_blob_centers("screenshot.png",tracker_colors,10,10)
-    print(f"Found tracker blobs at: {color_blob_centers}")
+
+    # --- Find blob centres for every tracker colour ---
+    tracker_colors = [(r, g, b) for (x, y, z, r, g, b) in trackers_list]
+    color_blob_centers = find_blob_centers(path, tracker_colors, tolerance=10, min_blob_size=10)
+    print(f"Found tracker blobs: {color_blob_centers}")
+
+    # --- Build 2D-3D correspondences (row,col) → (px,py) ---
+    correspondences = []
+    for tx, ty, tz, tr, tg, tb in trackers_list:
+        blobs = color_blob_centers.get((tr, tg, tb), [])
+        if not blobs:
+            continue
+        row, col = blobs[0]                           # largest blob centroid
+        correspondences.append(((float(col), float(row)), (tx, ty, tz)))
+
+    print(f"Using {len(correspondences)} tracker correspondences for PnP")
+
+    if not correspondences:
+        print("No tracker blobs found — cannot estimate camera pose.")
+        tracker_pnp_result      = None
+        tracker_correspondences = []
+        return
+
+    # Store in tracker-specific globals — picking state is untouched
+    tracker_correspondences = correspondences
+    tracker_pnp_result      = solve_pnp(correspondences, half_w, height)
+    status = "ok" if (tracker_pnp_result and tracker_pnp_result[0]) else "low-confidence"
+    print(f"Tracker PnP solved ({status})")
 
         
 
@@ -637,7 +670,8 @@ def save_left_screenshot():
 # Main draw (split-screen)
 # ---------------------------------------------------------------------------
 def draw(recording_mode):
-    global picking_mode, pnp_result, picked_correspondences
+    global picking_mode, picking_correspondences, picking_pnp_result
+    global trackers_mode, tracker_correspondences, tracker_pnp_result
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
 
@@ -665,9 +699,11 @@ def draw(recording_mode):
     render_scene(apply_input=False, recording_mode=recording_mode)
     c_x, c_y, c_z, r_x, r_y, r_z = old_cam
 
-    # World-space PnP overlay on top of the right view
-    if picking_mode and pnp_result is not None:
-        draw_pnp_world_overlay(pnp_result, picked_correspondences)
+    # World-space PnP overlay on top of the right view — use whichever mode is active
+    if picking_mode and picking_pnp_result is not None:
+        draw_pnp_world_overlay(picking_pnp_result, picking_correspondences)
+    elif trackers_mode and tracker_pnp_result is not None:
+        draw_pnp_world_overlay(tracker_pnp_result, tracker_correspondences)
 
     draw_seperator_line()
     pygame.display.flip()
@@ -681,11 +717,10 @@ def main():
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global saved_positions, recording_index, recording_mode
-    global picking_mode, picked_points, picked_correspondences
-    global trackers_mode, trackers_list
+    global picking_mode, picked_points, picking_correspondences, picking_pnp_result
+    global trackers_mode, trackers_list, tracker_correspondences, tracker_pnp_result
     global terrain_vbo, terrain_vertex_count
     global pyramid_vbo, pyramid_vertex_count
-    global pnp_result
 
     CONFIG = read_config()
     pygame.init()
@@ -696,8 +731,10 @@ def main():
     print(f"Loaded {len(trackers_list)} trackers from trackers.trk")
     saved_positions        = []
     picked_points          = []
-    picked_correspondences = []
-    pnp_result             = None
+    picking_correspondences  = []
+    picking_pnp_result       = None
+    tracker_correspondences  = []
+    tracker_pnp_result       = None
     recording_mode         = True
     recording_index        = 0
 
@@ -710,14 +747,15 @@ def main():
     r_x = r_y = r_z = 0.0
     r_x2 = r_y2 = r_z2 = 0.0
     r_x = r_x2 = 30
-
+    saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))
     display = (640*2, 480)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
     resize(*display)
     init()
 
     image = cv2.imread(CONFIG.get("map_path"))
-    terrain_vbo, terrain_vertex_count = build_terrain_vbo("test2.tri", image, margin)
+    color_image = cv2.imread(CONFIG.get("color_map_path"))
+    terrain_vbo, terrain_vertex_count = build_terrain_vbo("test2.tri", image, margin, color_image)
     pyramid_vbo, pyramid_vertex_count = build_pyramid_vbo()
     print(f"Terrain VBO built: {terrain_vertex_count} vertices")
 
@@ -742,10 +780,11 @@ def main():
                     trackers_mode = not trackers_mode
                     if trackers_mode:
                         picking_mode   = False
-                        pnp_result     = None
                         recording_mode = True   # ensure left view is free-move
                         print("Trackers mode ON  (B = screenshot, movement as normal)")
                     else:
+                        tracker_pnp_result      = None
+                        tracker_correspondences = []
                         print("Trackers mode OFF")
                 if event.key == K_r:
                     recording_index = 0
@@ -770,12 +809,12 @@ def main():
                             r_x2, r_y2, r_z2 = 30.0, 0.0, 0.0
                             print("Picking mode: no saved positions, right view at starting pos")
                     else:
-                        pnp_result = None      # clear overlay when leaving picking mode
+                        picking_pnp_result = None   # clear picking overlay on exit
                     print("picking mode", "on" if picking_mode else "off")
                 if event.key == K_c and picking_mode:
                     sw, sh = pygame.display.get_surface().get_size()
-                    pnp_result = solve_pnp(picked_correspondences, sw // 2, sh)
-                    status = "ok" if (pnp_result and pnp_result[0]) else "low-confidence"
+                    picking_pnp_result = solve_pnp(picking_correspondences, sw // 2, sh)
+                    status = "ok" if (picking_pnp_result and picking_pnp_result[0]) else "low-confidence"
                     print(f"PnP solved ({status}) - overlay active")
                 if event.key == K_LEFT and not recording_mode:
                     recording_index = (recording_index - 1) % len(saved_positions)
@@ -793,7 +832,7 @@ def main():
                         if world_point is not None:
                             image_point = (event.pos[0] - sw // 2, event.pos[1])
                             picked_points.append(world_point)
-                            picked_correspondences.append((image_point, world_point))
+                            picking_correspondences.append((image_point, world_point))
                             print(f"Picked 2D {image_point} -> 3D {world_point}")
                         else:
                             print("Picking missed terrain")
