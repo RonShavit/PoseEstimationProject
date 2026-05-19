@@ -89,7 +89,10 @@ def build_terrain_vbo(tri_path, image, margin, color_image = None):
     idx = 0
     for tri in tris:
         for v in (tri.v1, tri.v2, tri.v3):
-            bgr = color_image[int(v.z) * margin, int(v.x) * margin]
+            try:
+                bgr = color_image[int(v.z) * margin, int(v.x) * margin]
+            except IndexError:
+                bgr = (0, 0, 0)
             data[idx]   = bgr[2] / 255.0
             data[idx+1] = bgr[1] / 255.0
             data[idx+2] = bgr[0] / 255.0
@@ -222,48 +225,16 @@ def build_camera_intrinsics(view_w, view_h):
                      [0,  0,  1]], dtype=np.float64)
 
 
-def _points_are_coplanar(pts3d, tol=0.05):
-    """
-    Return True if all 3D points lie on (approximately) the same plane.
-    Uses PCA: if the smallest singular value is < tol × largest, they're coplanar.
-    Terrain points are nearly always coplanar, so this will almost always be True.
-    """
-    if len(pts3d) < 3:
-        return True
-    centred = pts3d - pts3d.mean(axis=0)
-    _, s, _ = np.linalg.svd(centred)
-    return s[-1] < tol * s[0]
-
-
-def _try_solvers(pts3d, pts2d, K, dist, solvers):
-    """
-    Try a list of (flag, label) solver pairs in order.
-    Returns (rvec, tvec) from the first one that succeeds, or (None, None).
-    """
-    for flag, label in solvers:
-        try:
-            ok, rvec, tvec = cv2.solvePnP(pts3d, pts2d, K, dist, flags=flag)
-            if ok:
-                print(f"Solver '{label}' succeeded.")
-                return rvec, tvec
-        except cv2.error as e:
-            print(f"Solver '{label}' failed: {e.msg.splitlines()[0]}")
-    return None, None
-
-
 def solve_pnp(picked_correspondences, view_w, view_h):
     """
     Estimate camera pose from N >= 1 2D-3D correspondences.
     Returns (success, cam_pos_world, (rx_deg, ry_deg, rz_deg), R, tvec)
     or      (False, None, None, None, None) on failure.
 
-    Terrain points are nearly always coplanar (flat mesh), so SQPNP is avoided
-    and EPNP / IPPE are preferred - they handle planar configurations correctly.
-
-    1 point : position-only hint, no rotation.
-    2 points: pad to 3 and use planar solvers.
-    3 points: IPPE (planar) then EPNP.
-    4+      : RANSAC(EPNP) then direct EPNP fallback, then LM refinement.
+    If fewer than 4 points are provided, the first point is duplicated (with a
+    tiny 2D jitter) until exactly 4 are reached before calling the solver.
+    The result will be low-confidence but the solver won't assert-fail.
+    4+ real points: RANSAC(EPNP) + optional LM refinement.
     """
     n = len(picked_correspondences)
     if n == 0:
@@ -278,53 +249,34 @@ def solve_pnp(picked_correspondences, view_w, view_h):
     pts2d = np.array([[p[0], p[1]] for (p, _) in picked_correspondences],
                      dtype=np.float64)
 
-    if n == 1:
-        print("Only 1 point: position-only hint, orientation unknown.")
-        cam_pos = pts3d[0].copy()
-        return False, cam_pos, (0.0, 0.0, 0.0), np.eye(3), np.zeros((3, 1))
+    # Pad to 4 by duplicating the first point with a tiny 2D jitter each time
+    if n < 4:
+        needed = 4 - n
+        for i in range(needed):
+            pts3d = np.vstack([pts3d, pts3d[[0]]])
+            jitter = np.array([[0.5 * (i + 1), 0.0]])   # distinct per duplicate
+            pts2d = np.vstack([pts2d, pts2d[[0]] + jitter])
+        print(f"Warning: only {n} real point(s) — padded to 4. Result is unreliable.")
 
-    if n == 2:
-        # Pad to 3 with a duplicated point + tiny 2D jitter so solvers don't degenerate
-        pts3d = np.vstack([pts3d, pts3d[[0]]])
-        pts2d = np.vstack([pts2d, pts2d[[0]] + np.array([[0.5, 0.5]])])
-        print("Warning: 2 points padded to 3 - result is very unreliable.")
+    # RANSAC for robustness (EPNP handles coplanar/terrain points correctly)
+    try:
+        ok, rvec, tvec, _ = cv2.solvePnPRansac(
+            pts3d, pts2d, K, dist, flags=cv2.SOLVEPNP_EPNP)
+    except cv2.error:
+        ok = False
 
-    coplanar = _points_are_coplanar(pts3d)
-    if coplanar:
-        print("Points appear coplanar (expected for terrain) - using planar solvers.")
+    if not ok:
+        ok, rvec, tvec = cv2.solvePnP(
+            pts3d, pts2d, K, dist, flags=cv2.SOLVEPNP_EPNP)
+    if not ok:
+        print("PnP failed.")
+        return False, None, None, None, None
 
-    if n <= 3:  # includes the padded-2 case
-        # IPPE is the best planar solver; EPNP also handles planar; P3P for 3 non-planar
-        solvers = ([(cv2.SOLVEPNP_IPPE,  "IPPE"),
-                    (cv2.SOLVEPNP_EPNP,  "EPNP")]
-                   if coplanar else
-                   [(cv2.SOLVEPNP_P3P,   "P3P"),
-                    (cv2.SOLVEPNP_EPNP,  "EPNP")])
-        rvec, tvec = _try_solvers(pts3d, pts2d, K, dist, solvers)
-        if rvec is None:
-            print("All solvers failed.")
-            return False, None, None, None, None
-
-    else:
-        # 4+ points: RANSAC for robustness
-        ransac_flag = cv2.SOLVEPNP_EPNP   # EPNP is robust to planar configs
-        try:
-            ok, rvec, tvec, _ = cv2.solvePnPRansac(
-                pts3d, pts2d, K, dist, flags=ransac_flag)
-        except cv2.error:
-            ok = False
-        if not ok:
-            solvers = [(cv2.SOLVEPNP_EPNP, "EPNP"),
-                       (cv2.SOLVEPNP_IPPE, "IPPE")]
-            rvec, tvec = _try_solvers(pts3d, pts2d, K, dist, solvers)
-        if rvec is None:
-            print("All solvers failed.")
-            return False, None, None, None, None
-        # Optional LM refinement - skip silently if it fails
-        try:
-            cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
-        except cv2.error:
-            pass
+    # Optional LM refinement — skip silently if it fails
+    try:
+        cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
+    except cv2.error:
+        pass
 
     proj, _ = cv2.projectPoints(pts3d, rvec, tvec, K, dist)
     err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1)))
@@ -766,6 +718,10 @@ def main():
                 running = False
 
             if event.type == KEYDOWN:
+                if event.key == K_F11:
+                    pygame.display.quit()
+                    print("Resetting application")
+                    main()
                 if event.key == K_ESCAPE:
                     running = False
                 if event.key == K_f:

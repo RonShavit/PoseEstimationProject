@@ -1,5 +1,5 @@
  margin:8
  start_h:-70
  map_path:map_2.png
- color_map_path:map_2.png
+ color_map_path:test_colors.png
  trackers_path:trackers.trk
