@@ -89,7 +89,10 @@ def build_terrain_vbo(tri_path, image, margin, color_image = None):
     idx = 0
     for tri in tris:
         for v in (tri.v1, tri.v2, tri.v3):
-            bgr = color_image[int(v.z) * margin, int(v.x) * margin]
+            try:
+                bgr = color_image[int(v.z) * margin, int(v.x) * margin]
+            except IndexError:
+                bgr = (0, 0, 0)
             data[idx]   = bgr[2] / 255.0
             data[idx+1] = bgr[1] / 255.0
             data[idx+2] = bgr[0] / 255.0
@@ -211,10 +214,14 @@ def build_camera_intrinsics(view_w, view_h):
     """
     Reconstruct the OpenCV K matrix that matches
     gluPerspective(45, view_w/view_h, NEAR, FAR).
+
+    gluPerspective defines fov_y; the horizontal focal length is
+    fx = fy * aspect, NOT fx = fy.  For a 640x480 half-viewport the
+    aspect is 4/3, so fx ≈ 772 while fy ≈ 579.
     """
     fov_y_rad = math.radians(45)
     fy = (view_h / 2.0) / math.tan(fov_y_rad / 2.0)
-    fx = fy
+    fx = fy * (view_w / view_h)   # aspect-corrected horizontal focal length
     cx = view_w / 2.0
     cy = view_h / 2.0
     return np.array([[fx, 0, cx],
@@ -588,14 +595,19 @@ def save_left_screenshot():
     color_blob_centers = find_blob_centers(path, tracker_colors, tolerance=10, min_blob_size=10)
     print(f"Found tracker blobs: {color_blob_centers}")
 
-    # --- Build 2D-3D correspondences (row,col) → (px,py) ---
+    # --- Build 2D-3D correspondences ---
+    # find_blob_centers returns (row, col) with row=0 at the BOTTOM of the image
+    # (it operates on the raw OpenGL pixel buffer internally before the flipud).
+    # The saved screenshot and PnP both use top-origin (row=0 at top), so we
+    # must flip: corrected_row = height - row.
     correspondences = []
     for tx, ty, tz, tr, tg, tb in trackers_list:
         blobs = color_blob_centers.get((tr, tg, tb), [])
         if not blobs:
             continue
         row, col = blobs[0]                           # largest blob centroid
-        correspondences.append(((float(col), float(row)), (tx, ty, tz)))
+        corrected_row = height - row                  # flip to top-origin
+        correspondences.append(((float(col), float(corrected_row)), (tx, ty, tz)))
 
     print(f"Using {len(correspondences)} tracker correspondences for PnP")
 
@@ -715,6 +727,10 @@ def main():
                 running = False
 
             if event.type == KEYDOWN:
+                if event.key == K_F11:
+                    pygame.display.quit()
+                    print("Resetting application")
+                    main()
                 if event.key == K_ESCAPE:
                     running = False
                 if event.key == K_f:
@@ -722,6 +738,19 @@ def main():
                 if event.key == K_b:
                     if trackers_mode:
                         save_left_screenshot()
+                        # Move the right view to the PnP-estimated camera position
+                        if tracker_pnp_result is not None and tracker_pnp_result[0]:
+                            _, cam_pos, euler_deg, _, _ = tracker_pnp_result
+                            if cam_pos is not None and euler_deg is not None:
+                                # cam_pos is world-space camera position; right-view
+                                # camera is stored as negative translation, so negate.
+                                c_x2, c_y2, c_z2 = -cam_pos[0], -cam_pos[1], -cam_pos[2]
+                                r_x2, r_y2, r_z2 = euler_deg[0], euler_deg[1], euler_deg[2]
+                                print(f"Right view moved to estimated pos "
+                                      f"({c_x2:.2f},{c_y2:.2f},{c_z2:.2f}) "
+                                      f"rot ({r_x2:.1f},{r_y2:.1f},{r_z2:.1f})")
+                        else:
+                            print("No valid PnP result yet — right view unchanged")
                     else:
                         print(f"Saved ({c_x},{c_y},{c_z}) rot ({r_x},{r_y},{r_z})")
                         saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))
@@ -734,7 +763,7 @@ def main():
                     else:
                         tracker_pnp_result      = None
                         tracker_correspondences = []
-                        print("Trackers mode OFF")
+                        print("Trackers mode OFF — correspondences cleared")
                 if event.key == K_r:
                     recording_index = 0
                     if saved_positions:
@@ -758,7 +787,9 @@ def main():
                             r_x2, r_y2, r_z2 = 30.0, 0.0, 0.0
                             print("Picking mode: no saved positions, right view at starting pos")
                     else:
-                        picking_pnp_result = None   # clear picking overlay on exit
+                        picking_pnp_result      = None   # clear picking overlay on exit
+                        picking_correspondences = []     # clear correspondences on exit
+                        picked_points           = []     # clear picked points on exit
                     print("picking mode", "on" if picking_mode else "off")
                 if event.key == K_c and picking_mode:
                     sw, sh = pygame.display.get_surface().get_size()

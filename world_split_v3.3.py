@@ -89,7 +89,10 @@ def build_terrain_vbo(tri_path, image, margin, color_image = None):
     idx = 0
     for tri in tris:
         for v in (tri.v1, tri.v2, tri.v3):
-            bgr = color_image[int(v.z) * margin, int(v.x) * margin]
+            try:
+                bgr = color_image[int(v.z) * margin, int(v.x) * margin]
+            except IndexError:
+                bgr = (0, 0, 0)
             data[idx]   = bgr[2] / 255.0
             data[idx+1] = bgr[1] / 255.0
             data[idx+2] = bgr[0] / 255.0
@@ -214,7 +217,7 @@ def build_camera_intrinsics(view_w, view_h):
     """
     fov_y_rad = math.radians(45)
     fy = (view_h / 2.0) / math.tan(fov_y_rad / 2.0)
-    fx = fy
+    fx = fy * (view_w / view_h)   # aspect-corrected; gluPerspective scales x by aspect
     cx = view_w / 2.0
     cy = view_h / 2.0
     return np.array([[fx, 0, cx],
@@ -595,7 +598,8 @@ def save_left_screenshot():
         if not blobs:
             continue
         row, col = blobs[0]                           # largest blob centroid
-        correspondences.append(((float(col), float(row)), (tx, ty, tz)))
+        corrected_row = height - row                  # find_blob_centers returns bottom-origin Y; flip to top-origin
+        correspondences.append(((float(col), float(corrected_row)), (tx, ty, tz)))
 
     print(f"Using {len(correspondences)} tracker correspondences for PnP")
 
@@ -715,6 +719,10 @@ def main():
                 running = False
 
             if event.type == KEYDOWN:
+                if event.key == K_F11:
+                    pygame.display.quit()
+                    print("Resetting application")
+                    main()
                 if event.key == K_ESCAPE:
                     running = False
                 if event.key == K_f:
