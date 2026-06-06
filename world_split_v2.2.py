@@ -660,7 +660,8 @@ def main():
     image = cv2.imread(CONFIG.get("map_path"))
     h, w, _ = image.shape
     margin   = CONFIG.get("margin")
-    starting_pos = (-w/margin/2, CONFIG.get("start_h"), -(h/margin)-100)
+    starting_pos = (-w/margin/2, float(CONFIG.get("start_h")), -(h/margin)-100)
+    saved_positions.append((*starting_pos, 30.0, 0.0, 0.0))
     c_x,  c_y,  c_z  = map(float, starting_pos)
     c_x2, c_y2, c_z2 = map(float, starting_pos)
     r_x = r_y = r_z = 0.0
