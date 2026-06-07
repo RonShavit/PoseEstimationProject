@@ -9,6 +9,7 @@ import numpy as np
 import ctypes
 from read_config import read_config
 from trackers import get_trackers_from_file
+from color_picking import find_blob_centers
 
 # ---------------------------------------------------------------------------
 # Clipping planes
@@ -31,7 +32,7 @@ _PYRAMID_BASE = [
     ( 0.5,  0.5, 0.5),
     (-0.5,  0.5, 0.5),
 ]
-_PYRAMID_SCALE = 0.3
+_PYRAMID_SCALE = 3
 
 
 def build_pyramid_vbo():
@@ -277,6 +278,10 @@ def solve_pnp(picked_correspondences, view_w, view_h):
     if n == 0:
         print("No points picked yet.")
         return False, None, None, None, None
+    
+    while n <= 3:
+        picked_correspondences.append(picked_correspondences[-1])
+        n += 1
 
     K    = build_camera_intrinsics(view_w, view_h)
     dist = np.zeros((4, 1))
@@ -360,6 +365,107 @@ def solve_pnp(picked_correspondences, view_w, view_h):
     print(f"PnP position error vs actual camera: {pos_error} units")
     print(f"PnP rotation error vs actual camera: {min(rot_error%360, 360-rot_error%360)} degrees")
     return True, cam_pos, euler, R, tvec
+
+
+def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
+    """
+    Estimate camera pose from tracker 2D-3D correspondences.
+
+    Returns (cam_pos_array, euler_deg_tuple) on success, or None on failure.
+    Never modifies any global state or display.
+    """
+    n = len(tracker_2d_3d_pairs)
+    print(f"\n--- Tracker PnP ({n} point{'s' if n != 1 else ''}) ---")
+
+    if n == 0:
+        print("No tracker pairs – skipping PnP.")
+        return None
+    while n<=3:
+        tracker_2d_3d_pairs.append(tracker_2d_3d_pairs[-1])
+        n+=1
+
+    K    = build_camera_intrinsics(view_w, view_h)
+    dist = np.zeros((4, 1))
+
+    pts3d = np.array([[w[0], w[1], w[2]] for (_, w) in tracker_2d_3d_pairs],
+                     dtype=np.float64)
+    pts2d = np.array([[p[0], p[1]] for (p, _) in tracker_2d_3d_pairs],
+                     dtype=np.float64)
+
+    if n == 1:
+        print("Only 1 point: position-only hint, orientation unknown.")
+        print(f"  Estimated pos (approx): {pts3d[0]}")
+        return None
+
+    if n == 2:
+        pts3d = np.vstack([pts3d, pts3d[[0]]])
+        pts2d = np.vstack([pts2d, pts2d[[0]] + np.array([[0.5, 0.5]])])
+        print("Warning: 2 points padded to 3 – result is unreliable.")
+
+    coplanar = _points_are_coplanar(pts3d)
+    if coplanar:
+        print("Points appear coplanar - using planar solvers.")
+
+    rvec = None
+    if n <= 3:
+        solvers = ([(cv2.SOLVEPNP_IPPE, "IPPE"),
+                    (cv2.SOLVEPNP_EPNP, "EPNP")]
+                   if coplanar else
+                   [(cv2.SOLVEPNP_P3P,  "P3P"),
+                    (cv2.SOLVEPNP_EPNP, "EPNP")])
+        rvec, tvec = _try_solvers(pts3d, pts2d, K, dist, solvers)
+    else:
+        try:
+            ok, rvec, tvec, _ = cv2.solvePnPRansac(
+                pts3d, pts2d, K, dist, flags=cv2.SOLVEPNP_EPNP)
+        except cv2.error:
+            ok = False
+        if not ok:
+            rvec, tvec = _try_solvers(
+                pts3d, pts2d, K, dist,
+                [(cv2.SOLVEPNP_EPNP, "EPNP"), (cv2.SOLVEPNP_IPPE, "IPPE")])
+        if rvec is not None:
+            try:
+                cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
+            except cv2.error:
+                pass
+
+    if rvec is None:
+        print("All solvers failed.")
+        return None
+
+    # Reprojection error
+    proj, _ = cv2.projectPoints(pts3d, rvec, tvec, K, dist)
+    reproj_err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1)))
+
+    # Camera position and orientation in world space
+    R, _    = cv2.Rodrigues(rvec)
+    cam_pos = (-R.T @ tvec).flatten()
+
+    ry_rad = math.atan2( R[0, 2],  R[2, 2])
+    rx_rad = math.asin(max(-1.0, min(1.0, -R[1, 2])))
+    rz_rad = math.atan2( R[1, 0],  R[1, 1])
+    euler  = (math.degrees(rx_rad), math.degrees(ry_rad), math.degrees(rz_rad))
+
+    # Compare against the actual LEFT camera
+    pos_err  = math.sqrt(
+        (cam_pos[0] + c_x) ** 2 +
+        (cam_pos[1] + c_y) ** 2 +
+        (cam_pos[2] + c_z) ** 2
+    )
+    rot_raw  = (abs(euler[0] + r_x) + abs(euler[1] + r_y) + abs(euler[2] + r_z))
+    rot_err  = min(rot_raw % 360, 360 - rot_raw % 360)
+
+    print(f"  Reprojection error : {reproj_err:.2f} px")
+    print(f"  Estimated position : {cam_pos}")
+    print(f"  Estimated euler    : {euler} deg")
+    print(f"  Actual left cam pos: ({c_x:.2f}, {c_y:.2f}, {c_z:.2f})")
+    print(f"  Actual left cam rot: ({r_x:.2f}, {r_y:.2f}, {r_z:.2f}) deg")
+    print(f"  Position error     : {pos_err:.3f} units")
+    print(f"  Rotation error     : {rot_err:.3f} deg")
+    print("--- end tracker PnP ---\n")
+
+    return cam_pos, euler
 
 
 def get_reprojected_world_points(picked_correspondences, pnp_result, view_w, view_h):
@@ -541,6 +647,37 @@ def draw_camera_pyramid(x, y, z, rx, ry, rz):
     glPopMatrix()
 
 
+def draw_tracker_cam_pairs(pairs):
+    """
+    Draw blue pyramid for actual cam pos and green pyramid for estimated cam pos.
+    Each entry in pairs: ((ax,ay,az,arx,ary,arz), (ex,ey,ez,erx,ery,erz))
+    """
+    global pyramid_vbo, pyramid_vertex_count
+    s = _PYRAMID_SCALE * 1.5   # slightly larger than recording pyramids
+    for actual, estimated in pairs:
+        ax, ay, az, arx, ary, arz = actual
+        # Blue pyramid — actual camera position
+        glPushMatrix()
+        glTranslatef(-ax, -ay, -az)
+        glRotatef(-ary, 0, 1, 0)
+        glRotatef(-arx, 1, 0, 0)
+        glRotatef(-arz, 0, 0, 1)
+        glScalef(s, s, s)
+        draw_pyramid_vbo(pyramid_vbo, pyramid_vertex_count, (0.0, 0.3, 1.0))
+        glPopMatrix()
+
+        ex, ey, ez, erx, ery, erz = estimated
+        # Green pyramid — PnP-estimated camera position
+        glPushMatrix()
+        glTranslatef(-ex, -ey, -ez)
+        glRotatef(-ery, 0, 1, 0)
+        glRotatef(-erx, 1, 0, 0)
+        glRotatef(-erz, 0, 0, 1)
+        glScalef(s, s, s)
+        draw_pyramid_vbo(pyramid_vbo, pyramid_vertex_count, (0.0, 1.0, 0.2))
+        glPopMatrix()
+
+
 # ---------------------------------------------------------------------------
 # Scene rendering
 # ---------------------------------------------------------------------------
@@ -550,7 +687,7 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False):
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global picking_mode
     global terrain_vbo, terrain_vertex_count
-    global tracker_points
+    global tracker_points, tracker_cam_pairs
 
     r_speed   = 0.1
     rot_speed = 0.5
@@ -586,14 +723,24 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False):
     elif not apply_input and not picking_mode:
         c_x, c_y, c_z = c_x2, c_y2, c_z2
         r_x, r_y, r_z = r_x2, r_y2, r_z2
-        for pos in saved_positions:
-            px, py, pz, prx, pry, prz = pos
-            glPushMatrix()
-            glLoadIdentity()
-            glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
-            glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
-            draw_camera_pyramid(px, py, pz, prx, pry, prz)
-            glPopMatrix()
+        if trackers_mode and tracker_cam_pairs:
+            # In trackers mode the right view shows actual(blue) & estimated(green) pyramids
+            for pos in tracker_cam_pairs:
+                glPushMatrix()
+                glLoadIdentity()
+                glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
+                glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
+                draw_tracker_cam_pairs([pos])
+                glPopMatrix()
+        else:
+            for pos in saved_positions:
+                px, py, pz, prx, pry, prz = pos
+                glPushMatrix()
+                glLoadIdentity()
+                glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
+                glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
+                draw_camera_pyramid(px, py, pz, prx, pry, prz)
+                glPopMatrix()
 
     elif not apply_input and picking_mode:
         c_x, c_y, c_z = c_x2, c_y2, c_z2
@@ -653,7 +800,8 @@ def draw(recording_mode, trackers_mode=False):
     old_cam = (c_x, c_y, c_z, r_x, r_y, r_z)
     c_x, c_y, c_z = c_x2, c_y2, c_z2
     r_x, r_y, r_z = r_x2, r_y2, r_z2
-    render_scene(apply_input=False, recording_mode=recording_mode)
+    render_scene(apply_input=False, recording_mode=recording_mode,
+                 trackers_mode=trackers_mode)
     c_x, c_y, c_z, r_x, r_y, r_z = old_cam
 
     # World-space PnP overlay on top of the right view
@@ -676,7 +824,7 @@ def main():
     global terrain_vbo, terrain_vertex_count
     global pyramid_vbo, pyramid_vertex_count
     global pnp_result
-    global trackers_mode, tracker_points
+    global trackers_mode, tracker_points, tracker_cam_pairs
 
     CONFIG = read_config()
     pygame.init()
@@ -690,6 +838,7 @@ def main():
     recording_index        = 0
     trackers_mode          = False
     tracker_points         = []
+    tracker_cam_pairs      = []   # [(actual_6tuple, estimated_6tuple), ...]
     trackers_path = CONFIG.get("trackers_path", "trackers.txt")
     try:
         tracker_points = get_trackers_from_file(trackers_path)
@@ -710,6 +859,9 @@ def main():
 
     display = (640*2, 480)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
+    pygame.display.set_caption("World Split v3.5 - RECORDING MODE")
+    icon = pygame.image.load("wing.png")
+    pygame.display.set_icon(icon)
     resize(*display)
     init()
 
@@ -728,43 +880,101 @@ def main():
             if event.type == KEYDOWN:
                 if event.key == K_ESCAPE:
                     running = False
-                if event.key == K_f:
-                    pygame.display.toggle_fullscreen()
+                if event.key == K_F11:
+                    pygame.quit()
+                    running = False
+                    main()
                 if event.key == K_b:
                     if trackers_mode:
-                        # Screenshot the left half of the window
+                        # --- Screenshot the left half ---
                         sw, sh = pygame.display.get_surface().get_size()
                         half_w = sw // 2
-                        # Read pixels from the left viewport
                         glReadBuffer(GL_FRONT)
                         pixels = glReadPixels(0, 0, half_w, sh,
                                               GL_RGB, GL_UNSIGNED_BYTE)
                         img_array = np.frombuffer(pixels, dtype=np.uint8)
                         img_array = img_array.reshape((sh, half_w, 3))
-                        # OpenGL origin is bottom-left; flip vertically
-                        img_array = np.flipud(img_array)
-                        # Convert RGB -> BGR for OpenCV
-                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                        cv2.imwrite("screenshot.png", img_bgr)
+                        img_array = np.flipud(img_array)   # OpenGL is bottom-left
+                        img_bgr   = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                        screenshot_path = "screenshot.png"
+                        cv2.imwrite(screenshot_path, img_bgr)
                         print("Screenshot saved to screenshot.png")
+
+                        # --- Find 2-D blob centres for each tracker colour ---
+                        colors_rgb = [
+                            (int(t[3]), int(t[4]), int(t[5]))
+                            for t in tracker_points
+                        ]
+                        blob_map = find_blob_centers(
+                            screenshot_path,
+                            colors=colors_rgb,
+                        )
+
+                        # --- Build fresh 2D-3D pairs for this press only ---
+                        tracker_2d_3d_pairs = []
+                        for t in tracker_points:
+                            color_key = (int(t[3]), int(t[4]), int(t[5]))
+                            world_pos = (t[0], t[1], t[2])
+                            blobs     = blob_map.get(color_key, [])
+                            if not blobs:
+                                continue
+                            # Use the single centroid; if multiple blobs share
+                            # the same colour take the one closest to image centre
+                            if len(blobs) == 1:
+                                row, col = blobs[0]
+                            else:
+                                img_cy, img_cx = sh / 2.0, half_w / 2.0
+                                row, col = min(
+                                    blobs,
+                                    key=lambda rc: (rc[0]-img_cy)**2 + (rc[1]-img_cx)**2
+                                )
+                            screen_pos = (col, row)   # (x, y) pixel convention
+                            tracker_2d_3d_pairs.append((screen_pos, world_pos))
+
+                        print(f"Tracker 2D-3D pairs ({len(tracker_2d_3d_pairs)}):")
+                        for pair in tracker_2d_3d_pairs:
+                            print(f"  2D {pair[0]}  ->  3D {pair[1]}")
+
+                        # PnP estimation from tracker correspondences (print only)
+                        pnp_tracker_result = solve_pnp_trackers(tracker_2d_3d_pairs, half_w, sh)
+                        if pnp_tracker_result is not None:
+                            est_cam_pos, est_euler = pnp_tracker_result
+                            actual_tuple    = (c_x, c_y, c_z, r_x, r_y, r_z)
+                            estimated_tuple = (float(est_cam_pos[0]), float(est_cam_pos[1]),
+                                               float(est_cam_pos[2]), float(est_euler[0]),
+                                               float(est_euler[1]), float(est_euler[2]))
+                            tracker_cam_pairs.append((actual_tuple, estimated_tuple))
+                            print(f"Tracker cam pair saved (total: {len(tracker_cam_pairs)})")
                     else:
                         print(f"Saved ({c_x},{c_y},{c_z}) rot ({r_x},{r_y},{r_z})")
                         saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))
                 if event.key == K_t:
                     trackers_mode = not trackers_mode
                     if trackers_mode:
+                        pygame.display.set_caption("World Split v3.5 - TRACKERS MODE")
                         # Disable other exclusive modes when entering trackers mode
                         picking_mode = False
                         pnp_result   = None
+                        # Snap right view to the first saved position (overview)
+                        if saved_positions:
+                            c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = saved_positions[0]
+                            print("Trackers mode: right view snapped to starting position")
                     print(f"Trackers mode: {'on' if trackers_mode else 'off'}")
                 if event.key == K_r:
                     recording_index = 0
                     if saved_positions:
                         recording_mode = not recording_mode
                     print(f"Recording mode: {recording_mode}")
+                    if recording_mode:
+                        pygame.display.set_caption("World Split v3.5 - RECORDING MODE")
+                        #print("Recording mode: right view shows saved positions")
+                    else:
+                        pygame.display.set_caption("World Split v3.5 - NAVIGATION MODE")
+                        #print("Navigation mode: right view mirrors left view")
                 if event.key == K_p:
                     picking_mode = not picking_mode
                     if picking_mode:
+                        pygame.display.set_caption("World Split v3.5 - PICKING MODE")
                         # Snap right view to last saved position (or starting pos if none)
                         if saved_positions:
                             c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = saved_positions[-1]

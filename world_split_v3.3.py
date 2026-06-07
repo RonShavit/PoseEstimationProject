@@ -9,6 +9,7 @@ import numpy as np
 import ctypes
 from read_config import read_config
 from trackers import get_trackers_from_file
+from color_picking import find_blob_centers
 
 # ---------------------------------------------------------------------------
 # Clipping planes
@@ -732,21 +733,54 @@ def main():
                     pygame.display.toggle_fullscreen()
                 if event.key == K_b:
                     if trackers_mode:
-                        # Screenshot the left half of the window
+                        # --- Screenshot the left half ---
                         sw, sh = pygame.display.get_surface().get_size()
                         half_w = sw // 2
-                        # Read pixels from the left viewport
                         glReadBuffer(GL_FRONT)
                         pixels = glReadPixels(0, 0, half_w, sh,
                                               GL_RGB, GL_UNSIGNED_BYTE)
                         img_array = np.frombuffer(pixels, dtype=np.uint8)
                         img_array = img_array.reshape((sh, half_w, 3))
-                        # OpenGL origin is bottom-left; flip vertically
-                        img_array = np.flipud(img_array)
-                        # Convert RGB -> BGR for OpenCV
-                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                        cv2.imwrite("screenshot.png", img_bgr)
+                        img_array = np.flipud(img_array)   # OpenGL is bottom-left
+                        img_bgr   = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                        screenshot_path = "screenshot.png"
+                        cv2.imwrite(screenshot_path, img_bgr)
                         print("Screenshot saved to screenshot.png")
+
+                        # --- Find 2-D blob centres for each tracker colour ---
+                        colors_rgb = [
+                            (int(t[3]), int(t[4]), int(t[5]))
+                            for t in tracker_points
+                        ]
+                        blob_map = find_blob_centers(
+                            screenshot_path,
+                            colors=colors_rgb,
+                        )
+
+                        # --- Build fresh 2D-3D pairs for this press only ---
+                        tracker_2d_3d_pairs = []
+                        for t in tracker_points:
+                            color_key = (int(t[3]), int(t[4]), int(t[5]))
+                            world_pos = (t[0], t[1], t[2])
+                            blobs     = blob_map.get(color_key, [])
+                            if not blobs:
+                                continue
+                            # Use the single centroid; if multiple blobs share
+                            # the same colour take the one closest to image centre
+                            if len(blobs) == 1:
+                                row, col = blobs[0]
+                            else:
+                                img_cy, img_cx = sh / 2.0, half_w / 2.0
+                                row, col = min(
+                                    blobs,
+                                    key=lambda rc: (rc[0]-img_cy)**2 + (rc[1]-img_cx)**2
+                                )
+                            screen_pos = (col, row)   # (x, y) pixel convention
+                            tracker_2d_3d_pairs.append((screen_pos, world_pos))
+
+                        print(f"Tracker 2D-3D pairs ({len(tracker_2d_3d_pairs)}):")
+                        for pair in tracker_2d_3d_pairs:
+                            print(f"  2D {pair[0]}  ->  3D {pair[1]}")
                     else:
                         print(f"Saved ({c_x},{c_y},{c_z}) rot ({r_x},{r_y},{r_z})")
                         saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))

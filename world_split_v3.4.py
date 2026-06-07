@@ -9,6 +9,7 @@ import numpy as np
 import ctypes
 from read_config import read_config
 from trackers import get_trackers_from_file
+from color_picking import find_blob_centers
 
 # ---------------------------------------------------------------------------
 # Clipping planes
@@ -360,6 +361,107 @@ def solve_pnp(picked_correspondences, view_w, view_h):
     print(f"PnP position error vs actual camera: {pos_error} units")
     print(f"PnP rotation error vs actual camera: {min(rot_error%360, 360-rot_error%360)} degrees")
     return True, cam_pos, euler, R, tvec
+
+
+def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
+    """
+    Estimate camera pose from tracker 2D-3D correspondences.
+
+    Uses the same solver strategy as solve_pnp() but:
+      - compares results against the LEFT camera (c_x/c_y/c_z / r_x/r_y/r_z)
+      - never modifies any global state or display
+      - only prints results and errors
+
+    Args:
+        tracker_2d_3d_pairs: list of ((px, py), (wx, wy, wz)) pairs
+        view_w, view_h:      pixel dimensions of the left viewport
+    """
+    n = len(tracker_2d_3d_pairs)
+    print(f"\n--- Tracker PnP ({n} point{'s' if n != 1 else ''}) ---")
+
+    if n == 0:
+        print("No tracker pairs – skipping PnP.")
+        return
+
+    K    = build_camera_intrinsics(view_w, view_h)
+    dist = np.zeros((4, 1))
+
+    pts3d = np.array([[w[0], w[1], w[2]] for (_, w) in tracker_2d_3d_pairs],
+                     dtype=np.float64)
+    pts2d = np.array([[p[0], p[1]] for (p, _) in tracker_2d_3d_pairs],
+                     dtype=np.float64)
+
+    if n == 1:
+        print("Only 1 point: position-only hint, orientation unknown.")
+        print(f"  Estimated pos (approx): {pts3d[0]}")
+        return
+
+    if n == 2:
+        pts3d = np.vstack([pts3d, pts3d[[0]]])
+        pts2d = np.vstack([pts2d, pts2d[[0]] + np.array([[0.5, 0.5]])])
+        print("Warning: 2 points padded to 3 – result is unreliable.")
+
+    coplanar = _points_are_coplanar(pts3d)
+    if coplanar:
+        print("Points appear coplanar – using planar solvers.")
+
+    if n <= 3:
+        solvers = ([(cv2.SOLVEPNP_IPPE, "IPPE"),
+                    (cv2.SOLVEPNP_EPNP, "EPNP")]
+                   if coplanar else
+                   [(cv2.SOLVEPNP_P3P,  "P3P"),
+                    (cv2.SOLVEPNP_EPNP, "EPNP")])
+        rvec, tvec = _try_solvers(pts3d, pts2d, K, dist, solvers)
+    else:
+        try:
+            ok, rvec, tvec, _ = cv2.solvePnPRansac(
+                pts3d, pts2d, K, dist, flags=cv2.SOLVEPNP_EPNP)
+        except cv2.error:
+            ok = False
+        if not ok:
+            rvec, tvec = _try_solvers(
+                pts3d, pts2d, K, dist,
+                [(cv2.SOLVEPNP_EPNP, "EPNP"), (cv2.SOLVEPNP_IPPE, "IPPE")])
+        if rvec is not None:
+            try:
+                cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
+            except cv2.error:
+                pass
+
+    if rvec is None:
+        print("All solvers failed.")
+        return
+
+    # Reprojection error
+    proj, _ = cv2.projectPoints(pts3d, rvec, tvec, K, dist)
+    reproj_err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1)))
+
+    # Camera position and orientation in world space
+    R, _    = cv2.Rodrigues(rvec)
+    cam_pos = (-R.T @ tvec).flatten()
+
+    ry_rad = math.atan2( R[0, 2],  R[2, 2])
+    rx_rad = math.asin(max(-1.0, min(1.0, -R[1, 2])))
+    rz_rad = math.atan2( R[1, 0],  R[1, 1])
+    euler  = (math.degrees(rx_rad), math.degrees(ry_rad), math.degrees(rz_rad))
+
+    # Compare against the actual LEFT camera
+    pos_err  = math.sqrt(
+        (cam_pos[0] + c_x) ** 2 +
+        (cam_pos[1] + c_y) ** 2 +
+        (cam_pos[2] + c_z) ** 2
+    )
+    rot_raw  = (abs(euler[0] + r_x) + abs(euler[1] + r_y) + abs(euler[2] + r_z))
+    rot_err  = min(rot_raw % 360, 360 - rot_raw % 360)
+
+    print(f"  Reprojection error : {reproj_err:.2f} px")
+    print(f"  Estimated position : {cam_pos}")
+    print(f"  Estimated euler    : {euler} deg")
+    print(f"  Actual left cam pos: ({c_x:.2f}, {c_y:.2f}, {c_z:.2f})")
+    print(f"  Actual left cam rot: ({r_x:.2f}, {r_y:.2f}, {r_z:.2f}) deg")
+    print(f"  Position error     : {pos_err:.3f} units")
+    print(f"  Rotation error     : {rot_err:.3f} deg")
+    print("--- end tracker PnP ---\n")
 
 
 def get_reprojected_world_points(picked_correspondences, pnp_result, view_w, view_h):
@@ -732,21 +834,57 @@ def main():
                     pygame.display.toggle_fullscreen()
                 if event.key == K_b:
                     if trackers_mode:
-                        # Screenshot the left half of the window
+                        # --- Screenshot the left half ---
                         sw, sh = pygame.display.get_surface().get_size()
                         half_w = sw // 2
-                        # Read pixels from the left viewport
                         glReadBuffer(GL_FRONT)
                         pixels = glReadPixels(0, 0, half_w, sh,
                                               GL_RGB, GL_UNSIGNED_BYTE)
                         img_array = np.frombuffer(pixels, dtype=np.uint8)
                         img_array = img_array.reshape((sh, half_w, 3))
-                        # OpenGL origin is bottom-left; flip vertically
-                        img_array = np.flipud(img_array)
-                        # Convert RGB -> BGR for OpenCV
-                        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                        cv2.imwrite("screenshot.png", img_bgr)
+                        img_array = np.flipud(img_array)   # OpenGL is bottom-left
+                        img_bgr   = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                        screenshot_path = "screenshot.png"
+                        cv2.imwrite(screenshot_path, img_bgr)
                         print("Screenshot saved to screenshot.png")
+
+                        # --- Find 2-D blob centres for each tracker colour ---
+                        colors_rgb = [
+                            (int(t[3]), int(t[4]), int(t[5]))
+                            for t in tracker_points
+                        ]
+                        blob_map = find_blob_centers(
+                            screenshot_path,
+                            colors=colors_rgb,
+                        )
+
+                        # --- Build fresh 2D-3D pairs for this press only ---
+                        tracker_2d_3d_pairs = []
+                        for t in tracker_points:
+                            color_key = (int(t[3]), int(t[4]), int(t[5]))
+                            world_pos = (t[0], t[1], t[2])
+                            blobs     = blob_map.get(color_key, [])
+                            if not blobs:
+                                continue
+                            # Use the single centroid; if multiple blobs share
+                            # the same colour take the one closest to image centre
+                            if len(blobs) == 1:
+                                row, col = blobs[0]
+                            else:
+                                img_cy, img_cx = sh / 2.0, half_w / 2.0
+                                row, col = min(
+                                    blobs,
+                                    key=lambda rc: (rc[0]-img_cy)**2 + (rc[1]-img_cx)**2
+                                )
+                            screen_pos = (col, row)   # (x, y) pixel convention
+                            tracker_2d_3d_pairs.append((screen_pos, world_pos))
+
+                        print(f"Tracker 2D-3D pairs ({len(tracker_2d_3d_pairs)}):")
+                        for pair in tracker_2d_3d_pairs:
+                            print(f"  2D {pair[0]}  ->  3D {pair[1]}")
+
+                        # PnP estimation from tracker correspondences (print only)
+                        solve_pnp_trackers(tracker_2d_3d_pairs, half_w, sh)
                     else:
                         print(f"Saved ({c_x},{c_y},{c_z}) rot ({r_x},{r_y},{r_z})")
                         saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))
