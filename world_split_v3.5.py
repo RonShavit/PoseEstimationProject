@@ -345,6 +345,7 @@ def solve_pnp(picked_correspondences, view_w, view_h):
 
     R, _ = cv2.Rodrigues(rvec)
     cam_pos = (-R.T @ tvec).flatten()
+    
 
     ry_rad = math.atan2( R[0, 2],  R[2, 2])
     rx_rad = math.asin(max(-1.0, min(1.0, -R[1, 2])))
@@ -441,18 +442,21 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
     # Camera position and orientation in world space
     R, _    = cv2.Rodrigues(rvec)
     cam_pos = (-R.T @ tvec).flatten()
+    cam_pos = [-c for c in cam_pos]  # negate to match OpenGL convention
 
     ry_rad = math.atan2( R[0, 2],  R[2, 2])
     rx_rad = math.asin(max(-1.0, min(1.0, -R[1, 2])))
     rz_rad = math.atan2( R[1, 0],  R[1, 1])
     euler  = (math.degrees(rx_rad), math.degrees(ry_rad), math.degrees(rz_rad))
+    #euler = tuple(-angle for angle in euler)  # negate to match OpenGL convention
 
     # Compare against the actual LEFT camera
     pos_err  = math.sqrt(
-        (cam_pos[0] + c_x) ** 2 +
-        (cam_pos[1] + c_y) ** 2 +
-        (cam_pos[2] + c_z) ** 2
+        (cam_pos[0] - c_x) ** 2 +
+        (cam_pos[1] - c_y) ** 2 +
+        (cam_pos[2] - c_z) ** 2
     )
+    
     rot_raw  = (abs(euler[0] + r_x) + abs(euler[1] + r_y) + abs(euler[2] + r_z))
     rot_err  = min(rot_raw % 360, 360 - rot_raw % 360)
 
@@ -951,9 +955,11 @@ def main():
                 if event.key == K_t:
                     trackers_mode = not trackers_mode
                     if trackers_mode:
+                        picking_mode = False  # disable picking mode when entering trackers mode
                         pygame.display.set_caption("World Split v3.5 - TRACKERS MODE")
                         # Disable other exclusive modes when entering trackers mode
                         picking_mode = False
+                        recording_mode = False
                         pnp_result   = None
                         # Snap right view to the first saved position (overview)
                         if saved_positions:
@@ -965,7 +971,10 @@ def main():
                     if saved_positions:
                         recording_mode = not recording_mode
                     print(f"Recording mode: {recording_mode}")
+                    picking_mode = False  # disable picking mode when toggling recording mode
+                    trackers_mode = False  # disable trackers mode when toggling recording mode
                     if recording_mode:
+                        
                         pygame.display.set_caption("World Split v3.5 - RECORDING MODE")
                         #print("Recording mode: right view shows saved positions")
                     else:
@@ -974,6 +983,8 @@ def main():
                 if event.key == K_p:
                     picking_mode = not picking_mode
                     if picking_mode:
+                        recording_mode = False  # disable recording mode when entering picking mode
+                        trackers_mode = False  # disable trackers mode when entering picking mode
                         pygame.display.set_caption("World Split v3.5 - PICKING MODE")
                         # Snap right view to last saved position (or starting pos if none)
                         if saved_positions:
@@ -1017,7 +1028,14 @@ def main():
                             print(f"Picked 2D {image_point} -> 3D {world_point}")
                         else:
                             print("Picking missed terrain")
-
+        if trackers_mode:
+            pygame.display.set_caption("Trackers mode | P - enter picking mode | B - estimate positon | R - toggle recording mode")
+        elif picking_mode:
+            pygame.display.set_caption("Picking mode | Click to pick points | C - solve PnP | R - toggle recording mode | T - toggle trackers mode")
+        elif recording_mode:
+            pygame.display.set_caption("Recording mode | Arrow keys to change index | R - toggle recording mode | T - toggle trackers mode | P - enter picking mode | B - record position")
+        else:
+            pygame.display.set_caption("Navigation mode | R - toggle recording mode | T - toggle trackers mode | P - enter picking mode")
         draw(recording_mode, trackers_mode)
 
     glDeleteBuffers(1, [terrain_vbo])
