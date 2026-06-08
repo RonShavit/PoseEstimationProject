@@ -448,14 +448,15 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
     rx_rad = math.asin(max(-1.0, min(1.0, -R[1, 2])))
     rz_rad = math.atan2( R[1, 0],  R[1, 1])
     euler  = (math.degrees(rx_rad), math.degrees(ry_rad), math.degrees(rz_rad))
-    euler = tuple(-angle for angle in euler)  # negate to match OpenGL convention
+    #euler = tuple(-angle for angle in euler)  # negate to match OpenGL convention
 
     # Compare against the actual LEFT camera
     pos_err  = math.sqrt(
-        (cam_pos[0] + c_x) ** 2 +
-        (cam_pos[1] + c_y) ** 2 +
-        (cam_pos[2] + c_z) ** 2
+        (cam_pos[0] - c_x) ** 2 +
+        (cam_pos[1] - c_y) ** 2 +
+        (cam_pos[2] - c_z) ** 2
     )
+    
     rot_raw  = (abs(euler[0] + r_x) + abs(euler[1] + r_y) + abs(euler[2] + r_z))
     rot_err  = min(rot_raw % 360, 360 - rot_raw % 360)
 
@@ -469,6 +470,7 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
     print("--- end tracker PnP ---\n")
 
     return cam_pos, euler
+
 
 
 def get_reprojected_world_points(picked_correspondences, pnp_result, view_w, view_h):
@@ -802,7 +804,7 @@ def draw(recording_mode, trackers_mode=False):
     # Tracker overlay on left view: both actual (blue) and estimated (green) pyramids
     # drawn with the same left-camera matrix so they sit correctly in the scene.
     if trackers_mode and tracker_overlay_active and tracker_cam_pairs:
-        pass
+        print(f"TODO : show both actual and estimated camera pyramids for tracker pair index {tracker_current_pair_index} = {tracker_cam_pairs[tracker_current_pair_index]}", end = "\r")
 
     # RIGHT VIEW
     glViewport(width // 2, 0, width // 2, height)
