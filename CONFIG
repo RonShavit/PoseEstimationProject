@@ -1,5 +1,5 @@
- margin:8
+ margin:1
  start_h:-70
- map_path:map_2.png
- color_map_path:map_2.png
+ map_path:test_hill.png
+ color_map_path:test_hill.png
  trackers_path:trackers.trk

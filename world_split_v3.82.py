@@ -788,8 +788,12 @@ def draw(recording_mode, trackers_mode=False):
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global tracker_cam_pairs, tracker_overlay_active, tracker_current_pair_index
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    try:
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    except Exception as e:
+        global running
+        running = False
+        return
     width, height = pygame.display.get_surface().get_size()
 
     # LEFT VIEW
@@ -801,9 +805,62 @@ def draw(recording_mode, trackers_mode=False):
     render_scene(apply_input=True, recording_mode=recording_mode,
                  trackers_mode=trackers_mode)
 
-
+    # Tracker overlay on left view: atop the real-position camera view (drawn
+    # above by render_scene), overlay the camera view from the estimated
+    # position at 36% opacity.
     if trackers_mode and tracker_overlay_active and tracker_cam_pairs:
-        print(f"TODO : show both actual and estimated camera pyramids for tracker pair index {tracker_current_pair_index} = {tracker_cam_pairs[tracker_current_pair_index]}", end = "\r")
+        # 1) Load the saved (real, estimate) camera positions for this pair.
+        real_cam, est_cam = tracker_cam_pairs[tracker_current_pair_index]
+        ex, ey, ez, erx, ery, erz = est_cam
+
+        # 2) Re-render the terrain from the estimated camera position, blended
+        #    over the existing left view at 36% opacity.
+        glViewport(0, 0, width // 2, height)
+        glMatrixMode(GL_PROJECTION); glLoadIdentity()
+        gluPerspective(45, (width / 2) / height, NEAR, FAR)
+        glMatrixMode(GL_MODELVIEW)
+
+        # The base (real-position) terrain is already in the colour + depth
+        # buffers; with depth testing on, the overlay fragments sit at the same
+        # depths and get rejected. Disable depth testing and blend on top.
+        glDisable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # Viewing the terrain "from" a stored camera pose is the INVERSE of how
+        # that camera's pyramid is placed in the world. The pyramid placement is
+        #     T(-pos) · Ry(-ry) · Rx(-rx) · Rz(-rz)        (see draw_tracker_cam_pairs)
+        # whose inverse is
+        #     Rz(rz) · Rx(rx) · Ry(ry) · T(pos)
+        # This was verified to reproduce the live left-view camera matrix
+        # exactly for the actual pose, so it is the correct convention for the
+        # estimate too (canonical X/Y/Z axes, this order).
+        glLoadIdentity()
+        glRotatef(erz, 0, 0, 1)
+        glRotatef(erx, 1, 0, 0)
+        glRotatef(ery, 0, 1, 0)
+        glTranslatef(ex, ey, ez)
+
+        # Draw the terrain geometry with a single flat translucent tint rather
+        # than its natural per-vertex colours. A natural-colour overlay is
+        # invisible when the estimate is good because it lands exactly on the
+        # identical base terrain (36% blend of an image over itself). A flat
+        # tint stays visible whether the estimated view aligns with the real one
+        # (terrain takes on the tint) or not (offset tinted ghost).
+        stride = 6 * 4
+        glBindBuffer(GL_ARRAY_BUFFER, terrain_vbo)
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glVertexPointer(3, GL_FLOAT, stride, ctypes.c_void_p(3 * 4))
+        glColor4f(0.2, 0.6, 1.0, 0.36)   # blue ghost @ 36%
+        glDrawArrays(GL_TRIANGLES, 0, terrain_vertex_count)
+        glDisableClientState(GL_VERTEX_ARRAY)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+        glDisable(GL_BLEND)
+        glDepthMask(GL_TRUE)
+        glEnable(GL_DEPTH_TEST)
 
     # RIGHT VIEW
     glViewport(width // 2, 0, width // 2, height)
@@ -841,7 +898,7 @@ def main():
     global pnp_result
     global trackers_mode, tracker_points, tracker_cam_pairs
     global tracker_overlay_active, tracker_current_pair_index
-
+    global running
     CONFIG = read_config()
     pygame.init()
 
@@ -964,6 +1021,7 @@ def main():
                             tracker_cam_pairs.append((actual_tuple, estimated_tuple))
                             tracker_current_pair_index = len(tracker_cam_pairs) - 1
                             print(f"Tracker cam pair saved (total: {len(tracker_cam_pairs)})")
+                            tracker_overlay_active = True
                     else:
                         print(f"Saved ({c_x},{c_y},{c_z}) rot ({r_x},{r_y},{r_z})")
                         saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))
@@ -987,13 +1045,13 @@ def main():
                     actual, _ = tracker_cam_pairs[tracker_current_pair_index]
                     c_x, c_y, c_z, r_x, r_y, r_z = actual
                     tracker_overlay_active = True
-                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)}")
+                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)} : actual: {actual[:3]} estimated: {tracker_cam_pairs[tracker_current_pair_index][1][:3]}")
                 if event.key == K_m and trackers_mode and tracker_cam_pairs:
                     tracker_current_pair_index = (tracker_current_pair_index + 1) % len(tracker_cam_pairs)
                     actual, _ = tracker_cam_pairs[tracker_current_pair_index]
                     c_x, c_y, c_z, r_x, r_y, r_z = actual
                     tracker_overlay_active = True
-                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)}")
+                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)} : actual: {actual[:3]} estimated: {tracker_cam_pairs[tracker_current_pair_index][1][:3]}")
                 if event.key == K_r:
                     recording_index = 0
                     if saved_positions:

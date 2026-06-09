@@ -801,9 +801,40 @@ def draw(recording_mode, trackers_mode=False):
     render_scene(apply_input=True, recording_mode=recording_mode,
                  trackers_mode=trackers_mode)
 
-
+    # Tracker overlay on left view: atop the real-position camera view (drawn
+    # above by render_scene), overlay the camera view from the estimated
+    # position at 36% opacity.
     if trackers_mode and tracker_overlay_active and tracker_cam_pairs:
-        print(f"TODO : show both actual and estimated camera pyramids for tracker pair index {tracker_current_pair_index} = {tracker_cam_pairs[tracker_current_pair_index]}", end = "\r")
+        # 1) Load the saved (real, estimate) camera positions for this pair.
+        real_cam, est_cam = tracker_cam_pairs[tracker_current_pair_index]
+        ex, ey, ez, erx, ery, erz = est_cam
+
+        # 2) Re-render the terrain from the estimated camera position, blended
+        #    over the existing left view at 36% opacity.
+        glViewport(0, 0, width // 2, height)
+        glMatrixMode(GL_PROJECTION); glLoadIdentity()
+        gluPerspective(45, (width / 2) / height, NEAR, FAR)
+        glMatrixMode(GL_MODELVIEW)
+
+        # Per-vertex terrain colours can't carry an alpha, so fade the whole
+        # overlay pass with a constant blend factor instead.
+        glEnable(GL_BLEND)
+        glBlendColor(0.0, 0.0, 0.0, 0.36)
+        glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA)
+        glDepthMask(GL_FALSE)
+        glClear(GL_DEPTH_BUFFER_BIT)
+
+        erxx =  math.cos(ery * math.pi / 180)
+        erzz =  math.sin(ery * math.pi / 180)
+        glLoadIdentity()
+        glRotatef(ery,  0,    1,    0)
+        glRotatef(erx,  erxx, 0,    erzz)
+        glRotatef(erz,  erzz, 0,    erxx)
+        glTranslatef(ex, ey, ez)
+        draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
+
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
 
     # RIGHT VIEW
     glViewport(width // 2, 0, width // 2, height)

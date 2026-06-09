@@ -469,7 +469,7 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
     print(f"  Rotation error     : {rot_err:.3f} deg")
     print("--- end tracker PnP ---\n")
 
-    return cam_pos, euler
+    return cam_pos, euler, R, tvec
 
 
 
@@ -788,8 +788,13 @@ def draw(recording_mode, trackers_mode=False):
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global tracker_cam_pairs, tracker_overlay_active, tracker_current_pair_index
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    global tracker_est_view_mats
+    try:
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    except Exception as e:
+        global running
+        running = False
+        return
     width, height = pygame.display.get_surface().get_size()
 
     # LEFT VIEW
@@ -801,9 +806,52 @@ def draw(recording_mode, trackers_mode=False):
     render_scene(apply_input=True, recording_mode=recording_mode,
                  trackers_mode=trackers_mode)
 
+    # Tracker overlay on left view: atop the real-position camera view (drawn
+    # above by render_scene), overlay the camera view from the estimated
+    # position at 36% opacity.
+    if (trackers_mode and tracker_overlay_active and tracker_cam_pairs
+            and tracker_current_pair_index in tracker_est_view_mats):
+        # Re-render the terrain from the PnP-estimated camera, blended over the
+        # existing left view. We use the exact OpenGL view matrix built from the
+        # PnP extrinsics [R|tvec] at save time, which avoids the Euler-angle
+        # flip ambiguity that made an angles-based transform point the wrong way
+        # on "good" estimates (PnP can report a 180°-flipped Euler branch).
+        view_mat = tracker_est_view_mats[tracker_current_pair_index]
 
-    if trackers_mode and tracker_overlay_active and tracker_cam_pairs:
-        print(f"TODO : show both actual and estimated camera pyramids for tracker pair index {tracker_current_pair_index} = {tracker_cam_pairs[tracker_current_pair_index]}", end = "\r")
+        glViewport(0, 0, width // 2, height)
+        glMatrixMode(GL_PROJECTION); glLoadIdentity()
+        gluPerspective(45, (width / 2) / height, NEAR, FAR)
+        glMatrixMode(GL_MODELVIEW)
+
+        # The base (real-position) terrain is already in the colour + depth
+        # buffers; with depth testing on, the overlay fragments sit at the same
+        # depths and get rejected. Disable depth testing and blend on top.
+        glDisable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # Load the precomputed estimated-camera view matrix (column-major).
+        glLoadMatrixd(view_mat)
+
+        # Flat translucent tint instead of natural per-vertex colours: a
+        # natural-colour overlay is invisible when the estimate is good because
+        # it lands exactly on the identical base terrain. The tint stays visible
+        # whether the estimated view aligns with the real one or not.
+        stride = 6 * 4
+        glBindBuffer(GL_ARRAY_BUFFER, terrain_vbo)
+        glDisableClientState(GL_COLOR_ARRAY)
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glVertexPointer(3, GL_FLOAT, stride, ctypes.c_void_p(3 * 4))
+        glColor4f(0.2, 0.6, 1.0, 0.40)   # blue ghost
+        glDrawArrays(GL_TRIANGLES, 0, terrain_vertex_count)
+        glDisableClientState(GL_VERTEX_ARRAY)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+        glDisable(GL_BLEND)
+        glDepthMask(GL_TRUE)
+        glEnable(GL_DEPTH_TEST)
 
     # RIGHT VIEW
     glViewport(width // 2, 0, width // 2, height)
@@ -840,8 +888,9 @@ def main():
     global pyramid_vbo, pyramid_vertex_count
     global pnp_result
     global trackers_mode, tracker_points, tracker_cam_pairs
+    global tracker_est_view_mats
     global tracker_overlay_active, tracker_current_pair_index
-
+    global running
     CONFIG = read_config()
     pygame.init()
 
@@ -855,6 +904,7 @@ def main():
     trackers_mode          = False
     tracker_points         = []
     tracker_cam_pairs           = []    # [(actual_6tuple, estimated_6tuple), ...]
+    tracker_est_view_mats       = {}    # pair_index -> 16-float column-major GL view matrix
     tracker_overlay_active      = False # True when N/M loaded a pair onto left view
     tracker_current_pair_index  = 0     # which pair is shown
     trackers_path = CONFIG.get("trackers_path", "trackers.txt")
@@ -956,14 +1006,28 @@ def main():
                         # PnP estimation from tracker correspondences (print only)
                         pnp_tracker_result = solve_pnp_trackers(tracker_2d_3d_pairs, half_w, sh)
                         if pnp_tracker_result is not None:
-                            est_cam_pos, est_euler = pnp_tracker_result
+                            est_cam_pos, est_euler, est_R, est_tvec = pnp_tracker_result
                             actual_tuple    = (c_x, c_y, c_z, r_x, r_y, r_z)
                             estimated_tuple = (float(est_cam_pos[0]), float(est_cam_pos[1]),
                                                float(est_cam_pos[2]), float(est_euler[0]),
                                                float(est_euler[1]), float(est_euler[2]))
                             tracker_cam_pairs.append((actual_tuple, estimated_tuple))
                             tracker_current_pair_index = len(tracker_cam_pairs) - 1
+                            # Store the unambiguous OpenGL view matrix for this
+                            # estimate, built directly from the PnP extrinsics
+                            # [R|tvec] (avoids all Euler-angle flip ambiguity).
+                            #   x_cam = R·X + tvec     (OpenCV: +Z forward, y down)
+                            #   M_gl  = diag(1,-1,-1)·[R|tvec]   (OpenGL: -Z forward, y up)
+                            ext = np.eye(4, dtype=np.float64)
+                            ext[:3, :3] = est_R
+                            ext[:3, 3]  = np.asarray(est_tvec, dtype=np.float64).flatten()
+                            flip = np.diag([1.0, -1.0, -1.0, 1.0])
+                            m_gl = flip @ ext
+                            # OpenGL wants column-major order; transpose to flat list.
+                            tracker_est_view_mats[tracker_current_pair_index] = \
+                                m_gl.T.flatten().astype(np.float64).tolist()
                             print(f"Tracker cam pair saved (total: {len(tracker_cam_pairs)})")
+                            tracker_overlay_active = True
                     else:
                         print(f"Saved ({c_x},{c_y},{c_z}) rot ({r_x},{r_y},{r_z})")
                         saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))
@@ -987,13 +1051,13 @@ def main():
                     actual, _ = tracker_cam_pairs[tracker_current_pair_index]
                     c_x, c_y, c_z, r_x, r_y, r_z = actual
                     tracker_overlay_active = True
-                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)}")
+                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)} : actual: {actual[:3]} estimated: {tracker_cam_pairs[tracker_current_pair_index][1][:3]}")
                 if event.key == K_m and trackers_mode and tracker_cam_pairs:
                     tracker_current_pair_index = (tracker_current_pair_index + 1) % len(tracker_cam_pairs)
                     actual, _ = tracker_cam_pairs[tracker_current_pair_index]
                     c_x, c_y, c_z, r_x, r_y, r_z = actual
                     tracker_overlay_active = True
-                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)}")
+                    print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)} : actual: {actual[:3]} estimated: {tracker_cam_pairs[tracker_current_pair_index][1][:3]}")
                 if event.key == K_r:
                     recording_index = 0
                     if saved_positions:
