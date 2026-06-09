@@ -859,6 +859,45 @@ def draw(recording_mode, trackers_mode=False):
                  trackers_mode=trackers_mode)
     c_x, c_y, c_z, r_x, r_y, r_z = old_cam
 
+    # Picking-mode overlay on the RIGHT view: atop the right-position camera
+    # view, overlay the terrain as seen from the PnP-estimated camera at 36%
+    # opacity (same idea as the trackers overlay on the left view).
+    if picking_mode and pnp_result is not None and pnp_result[0]:
+        # pnp_result = (ok, cam_pos, euler, R, tvec). Build the OpenGL view
+        # matrix straight from the PnP extrinsics [R|tvec] to avoid Euler-angle
+        # flip ambiguity:
+        #   x_cam = R·X + tvec        (OpenCV: +Z forward, y down)
+        #   M_gl  = diag(1,-1,-1)·[R|tvec]   (OpenGL: -Z forward, y up)
+        _, _, _, est_R, est_tvec = pnp_result
+        ext = np.eye(4, dtype=np.float64)
+        ext[:3, :3] = est_R
+        ext[:3, 3]  = np.asarray(est_tvec, dtype=np.float64).flatten()
+        m_gl = np.diag([1.0, -1.0, -1.0, 1.0]) @ ext
+        view_mat = m_gl.T.flatten().tolist()   # column-major for OpenGL
+
+        glViewport(width // 2, 0, width // 2, height)
+        glMatrixMode(GL_PROJECTION); glLoadIdentity()
+        gluPerspective(45, (width / 2) / height, NEAR, FAR)
+        glMatrixMode(GL_MODELVIEW)
+
+        # The base (right-position) terrain is already in the colour + depth
+        # buffers; with depth testing on, the overlay fragments sit at the same
+        # depths and get rejected. Disable depth testing and blend on top.
+        glDisable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)
+        glEnable(GL_BLEND)
+        # Per-vertex map colours carry no alpha, so fade the whole overlay pass
+        # with a constant blend factor (GL 1.4+, supported by the render context).
+        glBlendColor(0.0, 0.0, 0.0, 0.36)
+        glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA)
+
+        glLoadMatrixd(view_mat)
+        draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
+
+        glDisable(GL_BLEND)
+        glDepthMask(GL_TRUE)
+        glEnable(GL_DEPTH_TEST)
+
     # World-space PnP overlay on top of the right view
     if picking_mode and pnp_result is not None:
         draw_pnp_world_overlay(pnp_result, picked_correspondences)
