@@ -183,6 +183,95 @@ def draw_seperator_line():
 
 
 # ---------------------------------------------------------------------------
+# Screen-space text (PyGame font -> OpenGL texture, cached per string)
+# ---------------------------------------------------------------------------
+_text_font = None
+_text_cache = {}   # key -> (tex_id, w, h)
+
+
+def _get_text_font():
+    global _text_font
+    if _text_font is None:
+        if not pygame.font.get_init():
+            pygame.font.init()
+        _text_font = pygame.font.SysFont("Consolas", 20)
+    return _text_font
+
+
+def _get_text_texture(text, color, outline, outline_w):
+    """Build (and cache) an RGBA texture for a string with an optional outline."""
+    key = (text, color, outline, outline_w)
+    cached = _text_cache.get(key)
+    if cached is not None:
+        return cached
+
+    font = _get_text_font()
+    base = font.render(text, True, color)
+    if outline_w <= 0:
+        surf = base
+    else:
+        w, h = base.get_size()
+        surf = pygame.Surface((w + 2 * outline_w, h + 2 * outline_w), pygame.SRCALPHA)
+        outline_surf = font.render(text, True, outline)
+        for dx in range(-outline_w, outline_w + 1):
+            for dy in range(-outline_w, outline_w + 1):
+                if dx or dy:
+                    surf.blit(outline_surf, (outline_w + dx, outline_w + dy))
+        surf.blit(base, (outline_w, outline_w))
+
+    w, h = surf.get_size()
+    data = pygame.image.tostring(surf, "RGBA", True)
+    tex = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, data)
+    glBindTexture(GL_TEXTURE_2D, 0)
+
+    # Bound the cache so transient strings (changing every frame) can't leak
+    # textures without limit.
+    if len(_text_cache) > 64:
+        old_tex, _, _ = _text_cache.pop(next(iter(_text_cache)))
+        glDeleteTextures([old_tex])
+    _text_cache[key] = (tex, w, h)
+    return tex, w, h
+
+
+def draw_text_2d(text, x, y, color=(255, 255, 255), outline=(0, 0, 0),
+                 outline_w=2):
+    """Draw a string at pixel (x, y) measured from the TOP-LEFT of the window."""
+    tex, w, h = _get_text_texture(text, color, outline, outline_w)
+    width, height = pygame.display.get_surface().get_size()
+
+    glViewport(0, 0, width, height)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, width, height, 0, -1, 1)          # pixel coords, y-down
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+
+    glDisable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glColor4f(1, 1, 1, 1)
+    glBegin(GL_QUADS)
+    glTexCoord2f(0, 1); glVertex2f(x,     y)
+    glTexCoord2f(1, 1); glVertex2f(x + w, y)
+    glTexCoord2f(1, 0); glVertex2f(x + w, y + h)
+    glTexCoord2f(0, 0); glVertex2f(x,     y + h)
+    glEnd()
+    glBindTexture(GL_TEXTURE_2D, 0)
+    glDisable(GL_TEXTURE_2D)
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+# ---------------------------------------------------------------------------
 # Camera / picking helpers
 # ---------------------------------------------------------------------------
 def setup_right_view_matrices(width, height):
@@ -821,7 +910,19 @@ def draw(recording_mode, trackers_mode=False):
         glDepthMask(GL_TRUE)
         glEnable(GL_DEPTH_TEST)
 
-    # RIGHT VIEW
+        # Show the saved pair's position/rotation error in the top-left corner.
+        real_cam, est_cam = tracker_cam_pairs[tracker_current_pair_index]
+        t_pos_err = math.sqrt((est_cam[0] - real_cam[0]) ** 2 +
+                              (est_cam[1] - real_cam[1]) ** 2 +
+                              (est_cam[2] - real_cam[2]) ** 2)
+        t_rot_raw = (min(abs(est_cam[3] + real_cam[3]), 360 - abs(est_cam[3] + real_cam[3])) +
+                     min(abs(est_cam[4] + real_cam[4]), 360 - abs(est_cam[4] + real_cam[4])) +
+                     min(abs(est_cam[5] + real_cam[5]), 360 - abs(est_cam[5] + real_cam[5])))
+        t_rot_err = min(t_rot_raw % 360, 360 - t_rot_raw % 360)
+        draw_text_2d(f"pos err: {t_pos_err:.2f} units", 12, 10,
+                     color=(255, 230, 120))
+        draw_text_2d(f"rot err: {t_rot_err:.2f} deg", 12, 34,
+                     color=(255, 230, 120))
     glViewport(width // 2, 0, width // 2, height)
     glMatrixMode(GL_PROJECTION); glLoadIdentity()
     gluPerspective(45, (width/2) / height, NEAR, FAR)
@@ -874,10 +975,32 @@ def draw(recording_mode, trackers_mode=False):
         glDepthMask(GL_TRUE)
         glEnable(GL_DEPTH_TEST)
 
-    # World-space PnP overlay on top of the right view
+        # Show the PnP position/rotation error vs the actual (right) camera in
+        # the top-left corner of the RIGHT viewport. Mirrors solve_pnp exactly:
+        # the estimate is stored negated, so error uses (est + cam2).
+        _, est_pos, est_euler, _, _ = pnp_result
+        p_pos_err = math.sqrt((est_pos[0] + c_x2) ** 2 +
+                              (est_pos[1] + c_y2) ** 2 +
+                              (est_pos[2] + c_z2) ** 2)
+        p_rot_raw = (min(abs(est_euler[0] + r_x2), 360 - abs(est_euler[0] + r_x2)) +
+                     min(abs(est_euler[1] + r_y2), 360 - abs(est_euler[1] + r_y2)) +
+                     min(abs(est_euler[2] + r_z2), 360 - abs(est_euler[2] + r_z2)))
+        p_rot_err = min(p_rot_raw % 360, 360 - p_rot_raw % 360)
+        draw_text_2d(f"pos err: {p_pos_err:.2f} units", width // 2 + 12, 10,
+                     color=(255, 230, 120))
+        draw_text_2d(f"rot err: {p_rot_err:.2f} deg", width // 2 + 12, 34,
+                     color=(255, 230, 120))
     if picking_mode and pnp_result is not None:
         draw_pnp_world_overlay(pnp_result, picked_correspondences)
 
+    if picking_mode:
+        draw_text_2d("PICKING MODE", 12, height - 28, color=(255, 100, 100))
+    elif trackers_mode:
+        draw_text_2d("TRACKERS MODE", 12, height - 28, color=(100, 255, 100))
+    elif recording_mode:
+        draw_text_2d("RECORDING MODE", 12, height - 28, color=(100, 100, 255))
+    else:
+        draw_text_2d("VIEWING MODE", 12, height - 28, color=(200, 200, 200))
     draw_seperator_line()
     pygame.display.flip()
 
@@ -1055,6 +1178,9 @@ def main():
                         if saved_positions:
                             c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = saved_positions[0]
                             print("Trackers mode: right view snapped to starting position")
+                    else:
+                        if not picking_mode:
+                            recording_mode = True
                     print(f"Trackers mode: {'on' if trackers_mode else 'off'}")
                 if event.key == K_n and trackers_mode and tracker_cam_pairs:
                     tracker_current_pair_index = (tracker_current_pair_index - 1) % len(tracker_cam_pairs)
@@ -1100,6 +1226,8 @@ def main():
                             r_x2, r_y2, r_z2 = 30.0, 0.0, 0.0
                             print("Picking mode: no saved positions, right view at starting pos")
                     else:
+                        if trackers_mode == False:
+                            recording_mode = True
                         pnp_result = None      # clear overlay when leaving picking mode
                         picked_correspondences = []  # clear picked points when leaving picking mode
                         picked_points = []
@@ -1133,6 +1261,7 @@ def main():
         if trackers_mode:
             pair_info = f" | Pair {tracker_current_pair_index+1}/{len(tracker_cam_pairs)}" if tracker_cam_pairs else ""
             pygame.display.set_caption(f"Trackers mode | B - estimate | N/M - prev/next pair{pair_info} | P - picking | R - recording")
+            draw_text_2d("Trackers mode", 12, 10, color=(255, 230, 120))
         elif picking_mode:
             pygame.display.set_caption("Picking mode | Click to pick points | C - solve PnP | R - toggle recording mode | T - toggle trackers mode")
         elif recording_mode:
