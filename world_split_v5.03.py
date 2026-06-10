@@ -845,9 +845,9 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
             glPopMatrix()
 
     glLoadIdentity()
-    glRotatef(r_y,  0,  1,  0)
-    glRotatef(r_x, rx,  0, rz)
-    glRotatef(r_z, rz,  0, rx)
+    glRotatef(r_y, 0, 1, 0)
+    glRotatef(r_x, 1, 0, 0)
+    glRotatef(r_z, 0, 0, 1)
     glTranslatef(c_x, c_y, c_z)
     draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
 
@@ -1275,19 +1275,32 @@ def main():
                             m_gl = flip @ ext
                             view_mat = m_gl.T.flatten().astype(np.float64).tolist()
                         else:
-                            # Placeholder: reproduce the actual left-view matrix so
-                            # the overlay coincides with the real view (zero error).
-                            rx_a =  math.cos(r_y * math.pi / 180)
-                            rz_a =  math.sin(r_y * math.pi / 180)
-                            glMatrixMode(GL_MODELVIEW)
-                            glPushMatrix()
-                            glLoadIdentity()
-                            glRotatef(r_y,  0,    1,    0)
-                            glRotatef(r_x, rx_a,  0,  rz_a)
-                            glRotatef(r_z, rz_a,  0,  rx_a)
-                            glTranslatef(c_x, c_y, c_z)
-                            view_mat = list(glGetDoublev(GL_MODELVIEW_MATRIX).flatten())
-                            glPopMatrix()
+                            # Placeholder: reproduce the actual left-view matrix
+                            # so the overlay coincides exactly with the real view.
+                            # Built in numpy with the SAME (canonical-axis)
+                            # composition render_scene now uses, stored
+                            # column-major for glLoadMatrixd.
+                            def _rot(angle, ax, ay, az):
+                                a = math.radians(angle)
+                                c, s = math.cos(a), math.sin(a)
+                                n = math.sqrt(ax*ax + ay*ay + az*az)
+                                if n == 0:
+                                    return np.eye(4)
+                                ax, ay, az = ax/n, ay/n, az/n
+                                return np.array([
+                                    [ax*ax*(1-c)+c,    ax*ay*(1-c)-az*s, ax*az*(1-c)+ay*s, 0],
+                                    [ay*ax*(1-c)+az*s, ay*ay*(1-c)+c,    ay*az*(1-c)-ax*s, 0],
+                                    [az*ax*(1-c)-ay*s, az*ay*(1-c)+ax*s, az*az*(1-c)+c,    0],
+                                    [0, 0, 0, 1]], dtype=np.float64)
+                            def _trans(x, y, z):
+                                m = np.eye(4, dtype=np.float64)
+                                m[0, 3], m[1, 3], m[2, 3] = x, y, z
+                                return m
+                            M = (_rot(r_y, 0, 1, 0) @
+                                 _rot(r_x, 1, 0, 0) @
+                                 _rot(r_z, 0, 0, 1) @
+                                 _trans(c_x, c_y, c_z))
+                            view_mat = M.T.flatten().astype(np.float64).tolist()
                         feature_est_view_mats[feature_current_pair_index] = view_mat
                         print(f"Feature cam pair saved (total: {len(feature_cam_pairs)})")
                         feature_overlay_active = True

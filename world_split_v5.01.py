@@ -1398,6 +1398,9 @@ def main():
                         pnp_result = None      # clear overlay when leaving picking mode
                         picked_correspondences = []  # clear picked points when leaving picking mode
                         picked_points = []
+                        # Move the right view back to the initial position.
+                        if saved_positions:
+                            c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = saved_positions[0]
                         print("Picking mode: cleared picked points and PnP result")
                     print("picking mode", "on" if picking_mode else "off")
                 if event.key == K_c and picking_mode:
