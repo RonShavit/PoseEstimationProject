@@ -3,3 +3,4 @@
  map_path:maps\map_2.png
  color_map_path:colors\col_2.png
  trackers_path:trackers.trk
+ feature_ref_count:30
