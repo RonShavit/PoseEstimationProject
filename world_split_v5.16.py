@@ -13,6 +13,7 @@ from trackers import get_trackers_from_file
 from color_picking import find_blob_centers
 import sys
 import os
+import tqdm
 
 # ---------------------------------------------------------------------------
 # Clipping planes
@@ -823,7 +824,8 @@ def build_feature_database(view_w, view_h):
     poses = _reference_viewpoints()
     print(f"[features] learning from {len(poses)} reference viewpoint(s)...")
 
-    for i, pose in enumerate(poses):
+    for i, pose in tqdm.tqdm(enumerate(poses), desc="[features] rendering & detecting",
+                             total=len(poses), unit="view"):
         bgr, modelview, projection, viewport = _render_reference_view(
             view_w, view_h, pose)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -839,9 +841,9 @@ def build_feature_database(view_w, view_h):
             descriptors_all.append(d)
             points3d_all.append(p3d)
             kept += 1
-        print(f"[features]   view {i+1}/{len(poses)} "
-              f"(yaw={pose[4]:.0f}, pitch={pose[3]:.0f}): "
-              f"{len(kps)} keypoints, {kept} mapped to terrain")
+        #print(f"[features]   view {i+1}/{len(poses)} "
+        #      f"(yaw={pose[4]:.0f}, pitch={pose[3]:.0f}): "
+        #      f"{len(kps)} keypoints, {kept} mapped to terrain")
 
     if not descriptors_all:
         print("[features] WARNING: no features learned - database empty.")
@@ -1125,11 +1127,23 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
         keys_pressed = pygame.key.get_pressed()
         if recording_mode or trackers_mode or feature_mode:
             moved = False
-            if keys_pressed[K_LEFT]:   r_y -= rot_speed;  moved = True
-            if keys_pressed[K_RIGHT]:  r_y += rot_speed;  moved = True
+            yaw_delta = 0.0
+            if keys_pressed[K_LEFT]:   yaw_delta -= rot_speed;  moved = True
+            if keys_pressed[K_RIGHT]:  yaw_delta += rot_speed;  moved = True
             tilt = 0.0
             if keys_pressed[K_DOWN]:   tilt += rot_speed;  moved = True
             if keys_pressed[K_UP]:     tilt -= rot_speed;  moved = True
+
+            if yaw_delta:
+                # Preserve the current vertical tilt magnitude/direction while
+                # yawing: r_x,r_z encode tilt T as (T*cos(yaw), T*sin(yaw)).
+                # Recover T (signed by the old yaw) and re-project at new yaw.
+                old_yaw = r_y * math.pi / 180
+                tilt_mag = (r_x * math.cos(old_yaw) + r_z * math.sin(old_yaw))
+                r_y += yaw_delta
+                new_yaw = r_y * math.pi / 180
+                r_x = tilt_mag * math.cos(new_yaw)
+                r_z = tilt_mag * math.sin(new_yaw)
 
             if tilt:
                 yaw_rad = r_y * math.pi / 180
@@ -1476,7 +1490,7 @@ def main():
 
     display = (640*2, 480)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("World Split v3.5 - RECORDING MODE")
+    pygame.display.set_caption("NOW LOADING...")
     icon = pygame.image.load("icon.png")
     pygame.display.set_icon(icon)
     resize(*display)

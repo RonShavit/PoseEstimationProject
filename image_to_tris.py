@@ -21,7 +21,7 @@ def sample_pixels(image_path, margin):
     # Iterate with step = margin
     for y in range(0, height, margin):
         for x in range(0, width, margin):
-            r = int(gray[y, x])/255.0 * 10  # grayscale value (0–255)
+            r = int(gray[y, x])/255.0 * read_config().get("map_scale")  # grayscale value (0–255)
             samples.append((x/margin, r, y /margin))
 
     return samples
