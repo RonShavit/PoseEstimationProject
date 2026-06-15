@@ -351,7 +351,7 @@ def _try_solvers(pts3d, pts2d, K, dist, solvers):
     return None, None
 
 
-def solve_pnp(picked_correspondences, view_w, view_h):
+def solve_pnp(picked_correspondences, view_w, view_h, actual_cam=None):
     """
     Estimate camera pose from N >= 1 2D-3D correspondences.
     Returns (success, cam_pos_world, (rx_deg, ry_deg, rz_deg), R, tvec)
@@ -444,18 +444,29 @@ def solve_pnp(picked_correspondences, view_w, view_h):
     euler  = (math.degrees(rx_rad), math.degrees(ry_rad), math.degrees(rz_rad))
 
     print(f"PnP pos={cam_pos}  euler(deg)={euler}")
-    print(f"actual cam pos={c_x2, c_y2, c_z2}  euler(deg)={r_x2, r_y2, r_z2}")
+
+    # If no actual camera is provided, default to the RIGHT camera.
+    # This keeps Picking Mode behavior unchanged.
+    if actual_cam is None:
+        actual_cam = (c_x2, c_y2, c_z2, r_x2, r_y2, r_z2)
+
+    ax, ay, az, arx, ary, arz = actual_cam
+
+    print(f"actual cam pos={(ax, ay, az)}  euler(deg)={(arx, ary, arz)}")
+
     pos_error = 0
-    pos_error += math.pow(cam_pos[0]+c_x2, 2)
-    pos_error += math.pow(cam_pos[1]+c_y2, 2)
-    pos_error += math.pow(cam_pos[2]+c_z2, 2)
+    pos_error += math.pow(cam_pos[0] + ax, 2)
+    pos_error += math.pow(cam_pos[1] + ay, 2)
+    pos_error += math.pow(cam_pos[2] + az, 2)
     pos_error = math.sqrt(pos_error)
+
     rot_error = 0
-    rot_error += min(abs(euler[0]+r_x2), 360-abs(euler[0]+r_x2))
-    rot_error += min(abs(euler[1]+r_y2), 360-abs(euler[1]+r_y2))
-    rot_error += min(abs(euler[2]+r_z2), 360-abs(euler[2]+r_z2))
+    rot_error += min(abs(euler[0] + arx), 360 - abs(euler[0] + arx))
+    rot_error += min(abs(euler[1] + ary), 360 - abs(euler[1] + ary))
+    rot_error += min(abs(euler[2] + arz), 360 - abs(euler[2] + arz))
+
     print(f"PnP position error vs actual camera: {pos_error} units")
-    print(f"PnP rotation error vs actual camera: {min(rot_error%360, 360-rot_error%360)} degrees")
+    print(f"PnP rotation error vs actual camera: {min(rot_error % 360, 360 - rot_error % 360)} degrees")
     return True, cam_pos, euler, R, tvec
 
 
@@ -812,7 +823,7 @@ def build_feature_database(view_w, view_h):
 
 
 def estimate_pose_from_features(query_bgr, view_w, view_h,
-                                ratio=0.7, min_matches=6):
+                                ratio=0.7, min_matches=6, actual_cam=None):
     """
     Solver stage: SIFT-detect on the query image, FLANN-match against the
     learned database with Lowe's ratio test, build 2D-3D correspondences, and
@@ -857,7 +868,7 @@ def estimate_pose_from_features(query_bgr, view_w, view_h,
 
     # solve_pnp expects 2D in the same pixel frame as the query (top-left origin,
     # view_w x view_h), which is exactly what the screenshot keypoints use.
-    ok, cam_pos, euler, R, tvec = solve_pnp(correspondences, view_w, view_h)
+    ok, cam_pos, euler, R, tvec = solve_pnp(correspondences,view_w,view_h,actual_cam=actual_cam)
     if not ok:
         print("[features] solve_pnp failed on feature correspondences.")
         return None
@@ -1556,7 +1567,7 @@ def main():
                         # startup, recover 2D-3D correspondences, run solve_pnp.
                         # Returns None on failure -> placeholder fallback below.
                         feat_result = estimate_pose_from_features(
-                            img_bgr, half_w, sh)
+                            img_bgr, half_w, sh, actual_cam=(c_x, c_y, c_z, r_x, r_y, r_z))
                         if feat_result is not None:
                             est_cam_pos, est_euler, est_R, est_tvec = feat_result
                             # solve_pnp returns cam_pos as the TRUE world

@@ -1,7 +1,6 @@
 from email.mime import image
 
 import cv2
-from matplotlib import image
 import trimap_beta as tm
 from read_config import read_config
 
