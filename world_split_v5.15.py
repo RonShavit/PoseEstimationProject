@@ -12,6 +12,7 @@ from read_config import read_config
 from trackers import get_trackers_from_file
 from color_picking import find_blob_centers
 import sys
+import os
 
 # ---------------------------------------------------------------------------
 # Clipping planes
@@ -1148,7 +1149,7 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 ih, iw, _ = img.shape
                 m = CONFIG.get("margin")
                 c_x, c_y, c_z = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
-                r_x, r_y, r_z = 30, 0.0, 0.0
+                r_x, r_y, r_z = 10.0, 0.0, 0.0
                 tracker_overlay_active = False
                 feature_overlay_active = False
         else:
@@ -1465,12 +1466,12 @@ def main():
     h, w, _ = image.shape
     margin   = CONFIG.get("margin")
     starting_pos = (-w/margin/2, float(CONFIG.get("start_h")), -(h/margin)-100)
-    saved_positions.append((*starting_pos, 30.0, 0.0, 0.0))
+    saved_positions.append((*starting_pos, 10, 0.0, 0.0))
     c_x,  c_y,  c_z  = map(float, starting_pos)
     c_x2, c_y2, c_z2 = map(float, starting_pos)
     r_x = r_y = r_z = 0.0
     r_x2 = r_y2 = r_z2 = 0.0
-    r_x = r_x2 = 30
+    r_x = r_x2 = 10.0
 
     display = (640*2, 480)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
@@ -1766,7 +1767,7 @@ def main():
                             ih, iw, _ = image.shape
                             m = CONFIG.get("margin")
                             c_x2, c_y2, c_z2 = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
-                            r_x2, r_y2, r_z2 = 30.0, 0.0, 0.0
+                            r_x2, r_y2, r_z2 = 10.0, 0.0, 0.0
                             print("Picking mode: no saved positions, right view at starting pos")
                     else:
                         if trackers_mode == False and feature_mode == False:
