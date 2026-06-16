@@ -24,7 +24,7 @@ FAR  = 5000.0
 # ---------------------------------------------------------------------------
 # Tracker rendering
 # ---------------------------------------------------------------------------
-TRACKER_RADIUS = 3   # world-space radius of each tracker sphere
+TRACKER_RADIUS = 2   # world-space radius of each tracker sphere
 
 # ---------------------------------------------------------------------------
 # Pyramid VBO  (built once, instanced per camera position)
