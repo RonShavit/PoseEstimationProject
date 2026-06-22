@@ -1071,16 +1071,56 @@ def draw_sphere(x, y, z, color=(1, 0, 0), radius=0.3):
     glPushMatrix()
     glTranslatef(x, y, z)
     glColor3f(*color)
-    gluSphere(get_sphere_quadric(), radius, 16, 8)
+    gluSphere(get_sphere_quadric(), radius, 32, 4)
     glPopMatrix()
 
 
-def draw_right_image_points_2d(correspondences):
-    if not correspondences:
+def draw_2d_pick_marker(point, color, size=7):
+    x, y = point
+    glColor3f(*color)
+    glBegin(GL_LINES)
+    glVertex2f(x - size, y)
+    glVertex2f(x + size, y)
+    glVertex2f(x, y - size)
+    glVertex2f(x, y + size)
+    glEnd()
+
+
+def draw_2d_pick_dot(point, color=(1.0, 0.0, 0.0), radius=5):
+    x, y = point
+    glColor3f(*color)
+    glBegin(GL_TRIANGLE_FAN)
+    glVertex2f(x, y)
+    for i in range(17):
+        angle = 2.0 * math.pi * i / 16
+        glVertex2f(x + math.cos(angle) * radius,
+                   y + math.sin(angle) * radius)
+    glEnd()
+
+
+def draw_left_world_pick_markers(completed_points, pending_point):
+    if not completed_points and pending_point is None:
         return
     width, height = pygame.display.get_surface().get_size()
-    half_w = width // 2
-    size = 7
+    setup_left_view_matrices(width, height)
+    viewport = glGetIntegerv(GL_VIEWPORT)
+    modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+    projection = glGetDoublev(GL_PROJECTION_MATRIX)
+
+    projected_completed = []
+    for point in completed_points:
+        sx, sy, sz = gluProject(
+            point[0], point[1], point[2], modelview, projection, viewport)
+        if 0.0 <= sz <= 1.0:
+            projected_completed.append((sx, height - sy))
+
+    projected_pending = None
+    if pending_point is not None:
+        sx, sy, sz = gluProject(
+            pending_point[0], pending_point[1], pending_point[2],
+            modelview, projection, viewport)
+        if 0.0 <= sz <= 1.0:
+            projected_pending = (sx, height - sy)
 
     glViewport(0, 0, width, height)
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
@@ -1089,16 +1129,33 @@ def draw_right_image_points_2d(correspondences):
 
     glDisable(GL_DEPTH_TEST)
     glLineWidth(2.0)
-    glColor3f(0.0, 1.0, 0.0)
+    for point in projected_completed:
+        draw_2d_pick_marker(point, (0.0, 1.0, 0.0))
+    if projected_pending is not None:
+        draw_2d_pick_marker(projected_pending, (1.0, 1.0, 0.0), size=9)
+    glLineWidth(1.0)
+    glEnable(GL_DEPTH_TEST)
+
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+def draw_right_image_points_2d(correspondences):
+    if not correspondences:
+        return
+    width, height = pygame.display.get_surface().get_size()
+    half_w = width // 2
+
+    glViewport(0, 0, width, height)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, width, height, 0, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+
+    glDisable(GL_DEPTH_TEST)
+    glLineWidth(2.0)
     for (img_x, img_y), _ in correspondences:
-        x = half_w + img_x
-        y = img_y
-        glBegin(GL_LINES)
-        glVertex2f(x - size, y)
-        glVertex2f(x + size, y)
-        glVertex2f(x, y - size)
-        glVertex2f(x, y + size)
-        glEnd()
+        draw_2d_pick_dot((half_w + img_x, img_y))
     glLineWidth(1.0)
     glEnable(GL_DEPTH_TEST)
 
@@ -1267,14 +1324,6 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
     elif not apply_input and picking_mode:
         c_x, c_y, c_z = c_x2, c_y2, c_z2
         r_x, r_y, r_z = r_x2, r_y2, r_z2
-        for pos in picked_points:
-            px, py, pz = pos
-            glPushMatrix()
-            glLoadIdentity()
-            glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
-            glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
-            draw_sphere(px, py, pz)
-            glPopMatrix()
 
     glLoadIdentity()
     glRotatef(r_y, 0, 1, 0)
@@ -1282,15 +1331,6 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
     glRotatef(r_z, 0, 0, 1)
     glTranslatef(c_x, c_y, c_z)
     draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
-
-    if apply_input and picking_mode:
-        glDepthMask(GL_FALSE)
-        for pos in picked_points:
-            draw_sphere(*pos)
-        if pending_left_world_point is not None:
-            draw_sphere(*pending_left_world_point,
-                        color=(1.0, 1.0, 0.0), radius=0.45)
-        glDepthMask(GL_TRUE)
 
     # Draw trackers after terrain, reusing the same world-space matrix so
     # their positions stay fixed relative to the terrain regardless of camera.
@@ -1328,6 +1368,8 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
     draw_gradient_background()
     render_scene(apply_input=True, recording_mode=recording_mode,
                  trackers_mode=trackers_mode, feature_mode=feature_mode)
+    if picking_mode:
+        draw_left_world_pick_markers(picked_points, pending_left_world_point)
 
     # Tracker overlay on left view: atop the real-position camera view (drawn
     # above by render_scene), overlay the camera view from the estimated
