@@ -63,6 +63,25 @@ def clear_picking_state():
     picked_correspondences = []
     pnp_result = None
 
+
+def focus_pygame_window():
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = pygame.display.get_wm_info().get("window")
+        if not hwnd:
+            return False
+
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetFocus(hwnd)
+        return True
+    except Exception:
+        return False
+
 # ---------------------------------------------------------------------------
 # Clipping planes
 # ---------------------------------------------------------------------------
@@ -1609,6 +1628,8 @@ def main():
 
     display = (640*2, 480)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
+    pygame.event.pump()
+    focus_pygame_window()
     pygame.display.set_caption("NOW LOADING...")
     icon = pygame.image.load("icon.png")
     pygame.display.set_icon(icon)
