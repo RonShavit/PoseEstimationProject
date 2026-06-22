@@ -15,6 +15,45 @@ import sys
 import os
 import tqdm
 
+
+MAP_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def select_map_path(maps_dir="maps"):
+    map_files = sorted(
+        name for name in os.listdir(maps_dir)
+        if os.path.isfile(os.path.join(maps_dir, name))
+        and os.path.splitext(name)[1].lower() in MAP_EXTENSIONS
+    )
+    if not map_files:
+        print(f"No map files found in '{maps_dir}'.")
+        sys.exit(1)
+
+    print("\nSelect a map:\n")
+    for i, filename in enumerate(map_files, start=1):
+        print(f"{i}. {os.path.splitext(filename)[0]}")
+
+    while True:
+        choice = input("\nEnter selection: ").strip()
+        try:
+            index = int(choice)
+        except ValueError:
+            print(f"Invalid selection. Enter a number from 1 to {len(map_files)}.")
+            continue
+        if 1 <= index <= len(map_files):
+            return os.path.join(maps_dir, map_files[index - 1])
+        print(f"Invalid selection. Enter a number from 1 to {len(map_files)}.")
+
+
+def has_minimum_pnp_points(count):
+    if count < 4:
+        print(
+            "PnP requires at least 4 real 2D-3D correspondences; "
+            f"currently have {count}."
+        )
+        return False
+    return True
+
 # ---------------------------------------------------------------------------
 # Clipping planes
 # ---------------------------------------------------------------------------
@@ -409,26 +448,18 @@ def _try_solvers(pts3d, pts2d, K, dist, solvers):
 
 def solve_pnp(picked_correspondences, view_w, view_h, actual_cam=None):
     """
-    Estimate camera pose from N >= 1 2D-3D correspondences.
+    Estimate camera pose from N >= 4 2D-3D correspondences.
     Returns (success, cam_pos_world, (rx_deg, ry_deg, rz_deg), R, tvec)
     or      (False, None, None, None, None) on failure.
 
     Terrain points are nearly always coplanar (flat mesh), so SQPNP is avoided
     and EPNP / IPPE are preferred - they handle planar configurations correctly.
 
-    1 point : position-only hint, no rotation.
-    2 points: pad to 3 and use planar solvers.
-    3 points: IPPE (planar) then EPNP.
-    4+      : RANSAC(EPNP) then direct EPNP fallback, then LM refinement.
+    4+ points: RANSAC(EPNP) then direct EPNP fallback, then LM refinement.
     """
     n = len(picked_correspondences)
-    if n == 0:
-        print("No points picked yet.")
+    if not has_minimum_pnp_points(n):
         return False, None, None, None, None
-    
-    while n <= 3:
-        picked_correspondences.append(picked_correspondences[-1])
-        n += 1
 
     K    = build_camera_intrinsics(view_w, view_h)
     dist = np.zeros((4, 1))
@@ -438,53 +469,29 @@ def solve_pnp(picked_correspondences, view_w, view_h, actual_cam=None):
     pts2d = np.array([[p[0], p[1]] for (p, _) in picked_correspondences],
                      dtype=np.float64)
 
-    if n == 1:
-        print("Only 1 point: position-only hint, orientation unknown.")
-        cam_pos = pts3d[0].copy()
-        return False, cam_pos, (0.0, 0.0, 0.0), np.eye(3), np.zeros((3, 1))
-
-    if n == 2:
-        # Pad to 3 with a duplicated point + tiny 2D jitter so solvers don't degenerate
-        pts3d = np.vstack([pts3d, pts3d[[0]]])
-        pts2d = np.vstack([pts2d, pts2d[[0]] + np.array([[0.5, 0.5]])])
-        print("Warning: 2 points padded to 3 - result is very unreliable.")
-
     coplanar = _points_are_coplanar(pts3d)
     if coplanar:
         print("Points appear coplanar (expected for terrain) - using planar solvers.")
 
-    if n <= 3:  # includes the padded-2 case
-        # IPPE is the best planar solver; EPNP also handles planar; P3P for 3 non-planar
-        solvers = ([(cv2.SOLVEPNP_IPPE,  "IPPE"),
-                    (cv2.SOLVEPNP_EPNP,  "EPNP")]
-                   if coplanar else
-                   [(cv2.SOLVEPNP_P3P,   "P3P"),
-                    (cv2.SOLVEPNP_EPNP,  "EPNP")])
+    # 4+ points: RANSAC for robustness
+    ransac_flag = cv2.SOLVEPNP_EPNP   # EPNP is robust to planar configs
+    try:
+        ok, rvec, tvec, _ = cv2.solvePnPRansac(
+            pts3d, pts2d, K, dist, flags=ransac_flag)
+    except cv2.error:
+        ok = False
+    if not ok:
+        solvers = [(cv2.SOLVEPNP_EPNP, "EPNP"),
+                   (cv2.SOLVEPNP_IPPE, "IPPE")]
         rvec, tvec = _try_solvers(pts3d, pts2d, K, dist, solvers)
-        if rvec is None:
-            print("All solvers failed.")
-            return False, None, None, None, None
-
-    else:
-        # 4+ points: RANSAC for robustness
-        ransac_flag = cv2.SOLVEPNP_EPNP   # EPNP is robust to planar configs
-        try:
-            ok, rvec, tvec, _ = cv2.solvePnPRansac(
-                pts3d, pts2d, K, dist, flags=ransac_flag)
-        except cv2.error:
-            ok = False
-        if not ok:
-            solvers = [(cv2.SOLVEPNP_EPNP, "EPNP"),
-                       (cv2.SOLVEPNP_IPPE, "IPPE")]
-            rvec, tvec = _try_solvers(pts3d, pts2d, K, dist, solvers)
-        if rvec is None:
-            print("All solvers failed.")
-            return False, None, None, None, None
-        # Optional LM refinement - skip silently if it fails
-        try:
-            cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
-        except cv2.error:
-            pass
+    if rvec is None:
+        print("All solvers failed.")
+        return False, None, None, None, None
+    # Optional LM refinement - skip silently if it fails
+    try:
+        cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
+    except cv2.error:
+        pass
 
     proj, _ = cv2.projectPoints(pts3d, rvec, tvec, K, dist)
     err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1)))
@@ -537,9 +544,8 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
     if n == 0:
         print("No tracker pairs – skipping PnP.")
         return None
-    while n<=3:
-        tracker_2d_3d_pairs.append(tracker_2d_3d_pairs[-1])
-        n+=1
+    if not has_minimum_pnp_points(n):
+        return None
 
     K    = build_camera_intrinsics(view_w, view_h)
     dist = np.zeros((4, 1))
@@ -549,43 +555,26 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
     pts2d = np.array([[p[0], p[1]] for (p, _) in tracker_2d_3d_pairs],
                      dtype=np.float64)
 
-    if n == 1:
-        print("Only 1 point: position-only hint, orientation unknown.")
-        print(f"  Estimated pos (approx): {pts3d[0]}")
-        return None
-
-    if n == 2:
-        pts3d = np.vstack([pts3d, pts3d[[0]]])
-        pts2d = np.vstack([pts2d, pts2d[[0]] + np.array([[0.5, 0.5]])])
-        print("Warning: 2 points padded to 3 – result is unreliable.")
 
     coplanar = _points_are_coplanar(pts3d)
     if coplanar:
         print("Points appear coplanar - using planar solvers.")
 
     rvec = None
-    if n <= 3:
-        solvers = ([(cv2.SOLVEPNP_IPPE, "IPPE"),
-                    (cv2.SOLVEPNP_EPNP, "EPNP")]
-                   if coplanar else
-                   [(cv2.SOLVEPNP_P3P,  "P3P"),
-                    (cv2.SOLVEPNP_EPNP, "EPNP")])
-        rvec, tvec = _try_solvers(pts3d, pts2d, K, dist, solvers)
-    else:
+    try:
+        ok, rvec, tvec, _ = cv2.solvePnPRansac(
+            pts3d, pts2d, K, dist, flags=cv2.SOLVEPNP_EPNP)
+    except cv2.error:
+        ok = False
+    if not ok:
+        rvec, tvec = _try_solvers(
+            pts3d, pts2d, K, dist,
+            [(cv2.SOLVEPNP_EPNP, "EPNP"), (cv2.SOLVEPNP_IPPE, "IPPE")])
+    if rvec is not None:
         try:
-            ok, rvec, tvec, _ = cv2.solvePnPRansac(
-                pts3d, pts2d, K, dist, flags=cv2.SOLVEPNP_EPNP)
+            cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
         except cv2.error:
-            ok = False
-        if not ok:
-            rvec, tvec = _try_solvers(
-                pts3d, pts2d, K, dist,
-                [(cv2.SOLVEPNP_EPNP, "EPNP"), (cv2.SOLVEPNP_IPPE, "IPPE")])
-        if rvec is not None:
-            try:
-                cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
-            except cv2.error:
-                pass
+            pass
 
     if rvec is None:
         print("All solvers failed.")
@@ -1463,6 +1452,7 @@ def main():
     global feature_overlay_active, feature_current_pair_index
     global running
     CONFIG = read_config()
+    CONFIG["map_path"] = select_map_path()
     pygame.init()
 
     picking_mode           = False
@@ -1818,9 +1808,12 @@ def main():
                     print("picking mode", "on" if picking_mode else "off")
                 if event.key == K_c and picking_mode:
                     sw, sh = pygame.display.get_surface().get_size()
-                    pnp_result = solve_pnp(picked_correspondences, sw // 2, sh)
-                    status = "ok" if (pnp_result and pnp_result[0]) else "low-confidence"
-                    print(f"PnP solved ({status}) - overlay active")
+                    candidate_pnp_result = solve_pnp(picked_correspondences, sw // 2, sh)
+                    if candidate_pnp_result and candidate_pnp_result[0]:
+                        pnp_result = candidate_pnp_result
+                        print("PnP solved (ok) - overlay active")
+                    else:
+                        pnp_result = None
                 if event.key == K_LEFT and not recording_mode:
                     recording_index = (recording_index - 1) % len(saved_positions)
                 if event.key == K_RIGHT and not recording_mode:
