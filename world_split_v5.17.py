@@ -1680,7 +1680,7 @@ def main():
                             screenshot_path,
                             colors=colors_rgb,
                         )
-                        os.remove(screenshot_path)  # clean up the temporary screenshot
+                        # os.remove(screenshot_path) clean up the temporary screenshot
                         # --- Build fresh 2D-3D pairs for this press only ---
                         tracker_2d_3d_pairs = []
                         for t in tracker_points:
