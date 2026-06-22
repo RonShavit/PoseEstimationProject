@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+generated/
 .env
 .vscode/
 screenshot_feature.png

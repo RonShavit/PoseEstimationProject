@@ -17,6 +17,44 @@ import tqdm
 
 
 MAP_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+ACTIVE_MAP = None
+
+MAP_PROFILES = {
+    "map_1": {
+        "height_path": os.path.join("maps", "map_1.png"),
+        "color_path": os.path.join("colors", "col_1.png"),
+        "margin": 5,
+        "map_scale": 8.0,
+        "blur_sigma": 3.0,
+    },
+    "map_2": {
+        "height_path": os.path.join("maps", "map_2.png"),
+        "color_path": os.path.join("colors", "col_2.png"),
+        "margin": 8,
+        "map_scale": 20.0,
+        "blur_sigma": 0.0,
+    },
+    "map_3": {
+        "height_path": os.path.join("maps", "map_3.jpg"),
+        "color_path": os.path.join("colors", "col_3.png"),
+        "margin": 6,
+        "map_scale": 20.0,
+        "blur_sigma": 2.0,
+    },
+    "test_hill": {
+        "height_path": os.path.join("maps", "test_hill.png"),
+        "color_path": None,
+        "margin": 1,
+        "map_scale": 20.0,
+        "blur_sigma": 0.0,
+    },
+}
+
+DEFAULT_MAP_PROFILE = {
+    "margin": 8,
+    "map_scale": 20.0,
+    "blur_sigma": 0.0,
+}
 
 
 def select_map_path(maps_dir="maps"):
@@ -63,6 +101,27 @@ def select_matching_color_map(map_path, colors_dir="colors"):
             return candidate
 
     return None
+
+
+def select_map_profile():
+    selected_path = select_map_path()
+    map_name = os.path.splitext(os.path.basename(selected_path))[0]
+
+    if map_name in MAP_PROFILES:
+        profile = dict(MAP_PROFILES[map_name])
+    else:
+        profile = dict(DEFAULT_MAP_PROFILE)
+        profile["height_path"] = selected_path
+        profile["color_path"] = select_matching_color_map(selected_path)
+
+    profile["name"] = map_name
+    profile["tri_path"] = os.path.join("generated", f"{map_name}.tri")
+
+    color_path = profile.get("color_path")
+    if color_path and not os.path.isfile(color_path):
+        profile["color_path"] = None
+
+    return profile
 
 def has_minimum_pnp_points(count):
     if count < 4:
@@ -173,9 +232,17 @@ def draw_pyramid_vbo(vbo, vertex_count, tint):
 # ---------------------------------------------------------------------------
 # Terrain VBO
 # ---------------------------------------------------------------------------
-def build_terrain_vbo(tri_path, image, margin, color_map=None):
+def build_terrain_vbo(
+        tri_path, height_path, image, margin, map_scale, blur_sigma,
+        color_map=None):
     import image_to_tris
-    image_to_tris.main()
+    image_to_tris.main(
+        image_path=height_path,
+        margin=margin,
+        map_scale=map_scale,
+        output_path=tri_path,
+        blur_sigma=blur_sigma,
+    )
     tris = list(tm.read_tri_map(tri_path))
     vertex_count = len(tris) * 3
     data = np.empty(vertex_count * 6, dtype=np.float32)
@@ -727,7 +794,7 @@ def _terrain_world_bounds():
     Vertices are produced by image_to_tris as (x/margin, height, z/margin), so
     this reflects the real extent of the world rather than image dimensions.
     """
-    verts = tm.read_tri_map("test2.tri")
+    verts = tm.read_tri_map(ACTIVE_MAP["tri_path"])
     xs, ys, zs = [], [], []
     for t in verts:
         for v in (t.v1, t.v2, t.v3):
@@ -1263,7 +1330,7 @@ def draw_tracker_cam_pairs(pairs):
 # ---------------------------------------------------------------------------
 def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                  feature_mode=False):
-    global CONFIG
+    global CONFIG, ACTIVE_MAP
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global picking_mode, picked_points, pending_left_world_point
@@ -1317,9 +1384,9 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
             if moved and feature_mode:
                 feature_overlay_active = False
             if keys_pressed[K_BACKSPACE]:
-                img = cv2.imread(CONFIG.get("map_path"))
+                img = cv2.imread(ACTIVE_MAP["height_path"])
                 ih, iw, _ = img.shape
-                m = CONFIG.get("margin")
+                m = ACTIVE_MAP["margin"]
                 c_x, c_y, c_z = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
                 r_x, r_y, r_z = CONFIG.get("start_a"), 0.0, 0.0
                 tracker_overlay_active = False
@@ -1586,7 +1653,7 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
 # Main entry point
 # ---------------------------------------------------------------------------
 def main():
-    global CONFIG
+    global CONFIG, ACTIVE_MAP
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global saved_positions, recording_index, recording_mode
@@ -1602,13 +1669,19 @@ def main():
     global feature_overlay_active, feature_current_pair_index
     global running
     CONFIG = read_config()
-    CONFIG["map_path"] = select_map_path()
-    CONFIG["color_map_path"] = select_matching_color_map(CONFIG["map_path"])
+    ACTIVE_MAP = select_map_profile()
 
-    if CONFIG["color_map_path"] is not None:
-        print(f"Using matching color map: {CONFIG['color_map_path']}")
-    else:
-        print("No matching color map found; using the height map's own colors.")
+    color_summary = ACTIVE_MAP["color_path"] or "height-map colors"
+    print(
+        "Selected map: "
+        f"{ACTIVE_MAP['name']} | "
+        f"height={ACTIVE_MAP['height_path']} | "
+        f"color={color_summary} | "
+        f"margin={ACTIVE_MAP['margin']} | "
+        f"map_scale={ACTIVE_MAP['map_scale']} | "
+        f"blur_sigma={ACTIVE_MAP['blur_sigma']} | "
+        f"tri={ACTIVE_MAP['tri_path']}"
+    )
     
     pygame.init()
 
@@ -1638,12 +1711,12 @@ def main():
     except FileNotFoundError:
         print(f"Trackers file '{trackers_path}' not found – starting with no trackers")
 
-    image = cv2.imread(CONFIG.get("map_path"))
+    image = cv2.imread(ACTIVE_MAP["height_path"])
     if image is None:
-        print(f"Error: Failed to load map image from '{CONFIG.get('map_path')}'")
+        print(f"Error: Failed to load map image from '{ACTIVE_MAP['height_path']}'")
         sys.exit(1)
     h, w, _ = image.shape
-    margin   = CONFIG.get("margin")
+    margin = ACTIVE_MAP["margin"]
     starting_pos = (-w/margin/2, float(CONFIG.get("start_h")), -(h/margin)-100)
     saved_positions.append((*starting_pos, 10, 0.0, 0.0))
     c_x,  c_y,  c_z  = map(float, starting_pos)
@@ -1662,10 +1735,23 @@ def main():
     resize(*display)
     init()
 
-    image = cv2.imread(CONFIG.get("map_path"))
-    color_map_path = CONFIG.get("color_map_path")
+    color_map_path = ACTIVE_MAP["color_path"]
     col = cv2.imread(color_map_path) if color_map_path else None
-    terrain_vbo, terrain_vertex_count = build_terrain_vbo("test2.tri", image, margin, col)
+    if col is not None and col.shape[:2] != image.shape[:2]:
+        print(
+            f"Warning: resizing color map '{color_map_path}' from "
+            f"{col.shape[1]}x{col.shape[0]} to {w}x{h}."
+        )
+        col = cv2.resize(col, (w, h), interpolation=cv2.INTER_LINEAR)
+    terrain_vbo, terrain_vertex_count = build_terrain_vbo(
+        ACTIVE_MAP["tri_path"],
+        ACTIVE_MAP["height_path"],
+        image,
+        margin,
+        ACTIVE_MAP["map_scale"],
+        ACTIVE_MAP["blur_sigma"],
+        col,
+    )
     pyramid_vbo, pyramid_vertex_count = build_pyramid_vbo()
     print(f"Terrain VBO built: {terrain_vertex_count} vertices")
 
@@ -1949,9 +2035,9 @@ def main():
                             c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = saved_positions[-1]
                             print(f"Picking mode: right view set to last saved pos ({c_x2:.1f},{c_y2:.1f},{c_z2:.1f})")
                         else:
-                            image = cv2.imread(CONFIG.get("map_path"))
+                            image = cv2.imread(ACTIVE_MAP["height_path"])
                             ih, iw, _ = image.shape
-                            m = CONFIG.get("margin")
+                            m = ACTIVE_MAP["margin"]
                             c_x2, c_y2, c_z2 = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
                             r_x2, r_y2, r_z2 = CONFIG.get("start_a"), 0.0, 0.0
                             print("Picking mode: no saved positions, right view at starting pos")
