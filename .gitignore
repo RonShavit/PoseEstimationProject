@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .env
 .vscode/
+screenshot_feature.png
+screenshot.png
+# if we want to let git track those 2 screenshots again,
+# we remove those 2 lines from here(.gitignore) and
+# write in terminal: git add screenshot_feature.png screenshot.png
