@@ -37,8 +37,15 @@ MAP_PROFILES = {
     "map_3": {
         "height_path": os.path.join("maps", "map_3.jpg"),
         "color_path": os.path.join("colors", "col_3.png"),
-        "margin": 6,
+        "margin": 4,
         "map_scale": 20.0,
+        "blur_sigma": 2.0,
+    },
+    "map_4": {
+        "height_path": os.path.join("maps", "map_4.png"),
+        "color_path": os.path.join("colors", "col_4.png"),
+        "margin": 4,
+        "map_scale": 150.0,
         "blur_sigma": 2.0,
     },
     "test_hill": {
