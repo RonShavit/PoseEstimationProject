@@ -44,6 +44,25 @@ def select_map_path(maps_dir="maps"):
             return os.path.join(maps_dir, map_files[index - 1])
         print(f"Invalid selection. Enter a number from 1 to {len(map_files)}.")
 
+def select_matching_color_map(map_path, colors_dir="colors"):
+    """
+    For maps/map_N.ext, try colors/col_N with a supported image extension.
+    Return the path if found, otherwise None.
+    """
+    map_stem = os.path.splitext(os.path.basename(map_path))[0]  # e.g. map_2
+
+    if map_stem.startswith("map_"):
+        suffix = map_stem[len("map_"):]                         # e.g. 2
+        color_stem = f"col_{suffix}"                            # e.g. col_2
+    else:
+        color_stem = map_stem
+
+    for extension in MAP_EXTENSIONS:
+        candidate = os.path.join(colors_dir, color_stem + extension)
+        if os.path.isfile(candidate):
+            return candidate
+
+    return None
 
 def has_minimum_pnp_points(count):
     if count < 4:
@@ -1584,6 +1603,13 @@ def main():
     global running
     CONFIG = read_config()
     CONFIG["map_path"] = select_map_path()
+    CONFIG["color_map_path"] = select_matching_color_map(CONFIG["map_path"])
+
+    if CONFIG["color_map_path"] is not None:
+        print(f"Using matching color map: {CONFIG['color_map_path']}")
+    else:
+        print("No matching color map found; using the height map's own colors.")
+    
     pygame.init()
 
     picking_mode           = False
@@ -1637,7 +1663,8 @@ def main():
     init()
 
     image = cv2.imread(CONFIG.get("map_path"))
-    col = cv2.imread(CONFIG.get("color_map_path"))
+    color_map_path = CONFIG.get("color_map_path")
+    col = cv2.imread(color_map_path) if color_map_path else None
     terrain_vbo, terrain_vertex_count = build_terrain_vbo("test2.tri", image, margin, col)
     pyramid_vbo, pyramid_vertex_count = build_pyramid_vbo()
     print(f"Terrain VBO built: {terrain_vertex_count} vertices")
