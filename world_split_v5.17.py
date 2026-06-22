@@ -54,6 +54,15 @@ def has_minimum_pnp_points(count):
         return False
     return True
 
+
+def clear_picking_state():
+    global pending_left_world_point, picked_points, picked_correspondences
+    global pnp_result
+    pending_left_world_point = None
+    picked_points = []
+    picked_correspondences = []
+    pnp_result = None
+
 # ---------------------------------------------------------------------------
 # Clipping planes
 # ---------------------------------------------------------------------------
@@ -383,9 +392,25 @@ def setup_right_view_matrices(width, height):
     glTranslatef(c_x2, c_y2, c_z2)
 
 
-def get_world_coords(mouse_x, mouse_y):
+def setup_left_view_matrices(width, height):
+    glViewport(0, 0, width // 2, height)
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(45, (width / 2) / height, NEAR, FAR)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+    glRotatef(r_y, 0, 1, 0)
+    glRotatef(r_x, 1, 0, 0)
+    glRotatef(r_z, 0, 0, 1)
+    glTranslatef(c_x, c_y, c_z)
+
+
+def get_world_coords(mouse_x, mouse_y, view="right"):
     width, height = pygame.display.get_surface().get_size()
-    setup_right_view_matrices(width, height)
+    if view == "left":
+        setup_left_view_matrices(width, height)
+    else:
+        setup_right_view_matrices(width, height)
     viewport    = glGetIntegerv(GL_VIEWPORT)
     real_y      = height - mouse_y
     depth       = glReadPixels(mouse_x, real_y, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT)
@@ -1042,12 +1067,44 @@ def get_sphere_quadric():
     return _sphere_quadric
 
 
-def draw_sphere(x, y, z):
+def draw_sphere(x, y, z, color=(1, 0, 0), radius=0.3):
     glPushMatrix()
     glTranslatef(x, y, z)
-    glColor3f(1, 0, 0)
-    gluSphere(get_sphere_quadric(), 0.3, 16, 8)
+    glColor3f(*color)
+    gluSphere(get_sphere_quadric(), radius, 16, 8)
     glPopMatrix()
+
+
+def draw_right_image_points_2d(correspondences):
+    if not correspondences:
+        return
+    width, height = pygame.display.get_surface().get_size()
+    half_w = width // 2
+    size = 7
+
+    glViewport(0, 0, width, height)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, width, height, 0, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+
+    glDisable(GL_DEPTH_TEST)
+    glLineWidth(2.0)
+    glColor3f(0.0, 1.0, 0.0)
+    for (img_x, img_y), _ in correspondences:
+        x = half_w + img_x
+        y = img_y
+        glBegin(GL_LINES)
+        glVertex2f(x - size, y)
+        glVertex2f(x + size, y)
+        glVertex2f(x, y - size)
+        glVertex2f(x, y + size)
+        glEnd()
+    glLineWidth(1.0)
+    glEnable(GL_DEPTH_TEST)
+
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
 
 
 def draw_tracker_sphere(x, y, z, r=0.0, g=1.0, b=0.2):
@@ -1114,7 +1171,7 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
     global CONFIG
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
-    global picking_mode
+    global picking_mode, picked_points, pending_left_world_point
     global terrain_vbo, terrain_vertex_count
     global tracker_points, tracker_cam_pairs
     global tracker_overlay_active, tracker_current_pair_index
@@ -1173,7 +1230,7 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 tracker_overlay_active = False
                 feature_overlay_active = False
         else:
-            global saved_positions, recording_index, picked_points
+            global saved_positions, recording_index
             c_x, c_y, c_z, r_x, r_y, r_z = saved_positions[recording_index]
 
     elif not apply_input and not picking_mode:
@@ -1225,6 +1282,15 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
     glRotatef(r_z, 0, 0, 1)
     glTranslatef(c_x, c_y, c_z)
     draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
+
+    if apply_input and picking_mode:
+        glDepthMask(GL_FALSE)
+        for pos in picked_points:
+            draw_sphere(*pos)
+        if pending_left_world_point is not None:
+            draw_sphere(*pending_left_world_point,
+                        color=(1.0, 1.0, 0.0), radius=0.45)
+        glDepthMask(GL_TRUE)
 
     # Draw trackers after terrain, reusing the same world-space matrix so
     # their positions stay fixed relative to the terrain regardless of camera.
@@ -1419,6 +1485,9 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
         draw_pnp_world_overlay(pnp_result, picked_correspondences)
 
     if picking_mode:
+        draw_right_image_points_2d(picked_correspondences)
+
+    if picking_mode:
         draw_text_2d("PICKING MODE", 12, height - 28, color=(255, 100, 100))
     elif trackers_mode:
         draw_text_2d("TRACKERS MODE", 12, height - 28, color=(200, 200, 200))
@@ -1442,6 +1511,7 @@ def main():
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global saved_positions, recording_index, recording_mode
     global picking_mode, picked_points, picked_correspondences
+    global pending_left_world_point
     global terrain_vbo, terrain_vertex_count
     global pyramid_vbo, pyramid_vertex_count
     global pnp_result
@@ -1459,6 +1529,7 @@ def main():
     saved_positions        = []
     picked_points          = []
     picked_correspondences = []
+    pending_left_world_point = None
     pnp_result             = None
     recording_mode         = True
     recording_index        = 0
@@ -1507,15 +1578,6 @@ def main():
     terrain_vbo, terrain_vertex_count = build_terrain_vbo("test2.tri", image, margin, col)
     pyramid_vbo, pyramid_vertex_count = build_pyramid_vbo()
     print(f"Terrain VBO built: {terrain_vertex_count} vertices")
-
-    # Feature-mode startup: learn the SIFT/FLANN descriptor database from
-    # several reference viewpoints (renders to the back buffer; the main loop
-    # repaints immediately after, so nothing is left on screen).
-    try:
-        sw0, sh0 = pygame.display.get_surface().get_size()
-        build_feature_database(sw0 // 2, sh0)
-    except Exception as e:
-        print(f"[features] startup learning failed: {e}")
 
     running = True
     while running:
@@ -1703,10 +1765,11 @@ def main():
                 if event.key == K_t:
                     trackers_mode = not trackers_mode
                     if trackers_mode:
+                        if picking_mode:
+                            clear_picking_state()
                         picking_mode = False  # disable picking mode when entering trackers mode
                         pygame.display.set_caption("World Split v3.5 - TRACKERS MODE")
                         # Disable other exclusive modes when entering trackers mode
-                        picking_mode = False
                         recording_mode = False
                         feature_mode = False
                         feature_overlay_active = False
@@ -1724,6 +1787,8 @@ def main():
                     feature_mode = not feature_mode
                     if feature_mode:
                         # Exclusive with the other modes.
+                        if picking_mode:
+                            clear_picking_state()
                         picking_mode = False
                         trackers_mode = False
                         recording_mode = False
@@ -1768,6 +1833,8 @@ def main():
                     if saved_positions:
                         recording_mode = not recording_mode
                     print(f"Recording mode: {recording_mode}")
+                    if picking_mode:
+                        clear_picking_state()
                     picking_mode = False  # disable picking mode when toggling recording mode
                     trackers_mode = False  # disable trackers mode when toggling recording mode
                     feature_mode = False   # disable feature mode when toggling recording mode
@@ -1801,9 +1868,7 @@ def main():
                     else:
                         if trackers_mode == False and feature_mode == False:
                             recording_mode = True
-                        pnp_result = None      # clear overlay when leaving picking mode
-                        picked_correspondences = []  # clear picked points when leaving picking mode
-                        picked_points = []
+                        clear_picking_state()
                         print("Picking mode: cleared picked points and PnP result")
                     print("picking mode", "on" if picking_mode else "off")
                 if event.key == K_c and picking_mode:
@@ -1825,15 +1890,26 @@ def main():
             if event.type == MOUSEBUTTONDOWN:
                 if picking_mode and event.button == 1:
                     sw, sh = pygame.display.get_surface().get_size()
-                    if event.pos[0] >= sw // 2:
-                        world_point = get_world_coords(event.pos[0], event.pos[1])
+                    half_w = sw // 2
+                    if event.pos[0] < half_w:
+                        world_point = get_world_coords(event.pos[0], event.pos[1],
+                                                       view="left")
                         if world_point is not None:
-                            image_point = (event.pos[0] - sw // 2, event.pos[1])
-                            picked_points.append(world_point)
-                            picked_correspondences.append((image_point, world_point))
-                            print(f"Picked 2D {image_point} -> 3D {world_point}")
+                            pending_left_world_point = world_point
+                            print(f"Pending 3D point selected on left: {world_point}")
                         else:
-                            print("Picking missed terrain")
+                            print("Left picking missed terrain")
+                    else:
+                        if pending_left_world_point is None:
+                            print("Select a 3D point on the left before clicking the matching point on the right.")
+                            continue
+                        image_point = (event.pos[0] - half_w, event.pos[1])
+                        world_point = pending_left_world_point
+                        picked_points.append(world_point)
+                        picked_correspondences.append((image_point, world_point))
+                        pending_left_world_point = None
+                        pnp_result = None
+                        print(f"Picked 3D {world_point} -> 2D {image_point}")
         if trackers_mode:
             pair_info = f" | Pair {tracker_current_pair_index+1}/{len(tracker_cam_pairs)}" if tracker_cam_pairs else ""
             pygame.display.set_caption(f"Trackers mode | B - estimate | N/M - prev/next pair{pair_info} | P - picking | R - recording")
