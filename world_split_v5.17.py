@@ -1455,13 +1455,12 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 glPopMatrix()
         elif feature_mode and feature_run_attempts:
             # In feature mode the right view shows true, estimated, and failure path markers.
-            for pos in feature_run_attempts:
-                glPushMatrix()
-                glLoadIdentity()
-                glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
-                glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
-                draw_feature_run_attempts([pos])
-                glPopMatrix()
+            glPushMatrix()
+            glLoadIdentity()
+            glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
+            glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
+            draw_feature_run_attempts(feature_run_attempts)
+            glPopMatrix()
         elif not trackers_mode and not feature_mode:
             for pos in saved_positions:
                 px, py, pz, prx, pry, prz = pos
