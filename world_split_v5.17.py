@@ -23,8 +23,8 @@ MAP_PROFILES = {
     "map_1": {
         "height_path": os.path.join("maps", "map_1.png"),
         "color_path": os.path.join("colors", "col_1.png"),
-        "margin": 5,
-        "map_scale": 8.0,
+        "margin": 8,
+        "map_scale": 14.0,
         "blur_sigma": 3.0,
     },
     "map_2": {
@@ -37,9 +37,9 @@ MAP_PROFILES = {
     "map_3": {
         "height_path": os.path.join("maps", "map_3.jpg"),
         "color_path": os.path.join("colors", "col_3.png"),
-        "margin": 4,
-        "map_scale": 20.0,
-        "blur_sigma": 2.0,
+        "margin": 10,
+        "map_scale": 15.0,
+        "blur_sigma": 4.0,
     },
     "map_4": {
         "height_path": os.path.join("maps", "map_4.png"),
@@ -47,13 +47,6 @@ MAP_PROFILES = {
         "margin": 4,
         "map_scale": 150.0,
         "blur_sigma": 2.0,
-    },
-    "test_hill": {
-        "height_path": os.path.join("maps", "test_hill.png"),
-        "color_path": None,
-        "margin": 1,
-        "map_scale": 20.0,
-        "blur_sigma": 0.0,
     },
 }
 
