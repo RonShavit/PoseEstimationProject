@@ -863,6 +863,44 @@ def feature_view_matrix_from_pnp(R, tvec):
     return (flip @ ext).T.flatten().astype(np.float64).tolist()
 
 
+def validate_feature_pnp_correspondences(correspondences, min_count=4,
+                                         rounding_digits=6):
+    valid = []
+    distinct_2d = set()
+    distinct_3d = set()
+    for item in correspondences:
+        try:
+            image_point, world_point = item
+            p2 = tuple(float(v) for v in image_point)
+            p3 = tuple(float(v) for v in world_point)
+        except (TypeError, ValueError):
+            continue
+        if len(p2) != 2 or len(p3) != 3:
+            continue
+        if not all(math.isfinite(v) for v in p2 + p3):
+            continue
+        valid.append((p2, p3))
+        distinct_2d.add(tuple(round(v, rounding_digits) for v in p2))
+        distinct_3d.add(tuple(round(v, rounding_digits) for v in p3))
+
+    stats = {
+        "valid": len(valid),
+        "distinct_2d": len(distinct_2d),
+        "distinct_3d": len(distinct_3d),
+    }
+    if (stats["valid"] < min_count or
+            stats["distinct_2d"] < min_count or
+            stats["distinct_3d"] < min_count):
+        reason = (
+            "Feature PnP requires at least 4 distinct valid 2D-3D "
+            "correspondences. "
+            f"Valid: {stats['valid']}, distinct 2D: {stats['distinct_2d']}, "
+            f"distinct 3D: {stats['distinct_3d']}."
+        )
+        return False, valid, stats, reason
+    return True, valid, stats, None
+
+
 def solve_pnp_feature(correspondences, view_w, view_h, actual_cam):
     result = {
         "success": False,
@@ -876,17 +914,19 @@ def solve_pnp_feature(correspondences, view_w, view_h, actual_cam):
         "position_error": None,
         "rotation_error": None,
     }
-    if len(correspondences) < 4:
-        result["failure_reason"] = (
-            f"not enough matches for PnP ({len(correspondences)} < 4)"
-        )
+    is_valid, valid_correspondences, validation_stats, failure_reason = (
+        validate_feature_pnp_correspondences(correspondences)
+    )
+    result["validation_stats"] = validation_stats
+    if not is_valid:
+        result["failure_reason"] = failure_reason
         return result
 
     K = build_camera_intrinsics(view_w, view_h)
     dist = np.zeros((4, 1))
-    pts3d = np.array([[w[0], w[1], w[2]] for (_, w) in correspondences],
+    pts3d = np.array([[w[0], w[1], w[2]] for (_, w) in valid_correspondences],
                      dtype=np.float64)
-    pts2d = np.array([[p[0], p[1]] for (p, _) in correspondences],
+    pts2d = np.array([[p[0], p[1]] for (p, _) in valid_correspondences],
                      dtype=np.float64)
     try:
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -1225,8 +1265,42 @@ def draw_feature_pre_keypoints_2d():
     glMatrixMode(GL_MODELVIEW)
 
 
-def draw_feature_run_attempts(attempts):
+def _pose_to_render_position(pose):
+    return (-pose[0], -pose[1], -pose[2])
+
+
+def draw_world_polyline(points, color, width=3.0):
+    if len(points) < 2:
+        return
+    glDisable(GL_LIGHTING)
+    glLineWidth(width)
+    glColor3f(*color)
+    glBegin(GL_LINE_STRIP)
+    for point in points:
+        glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+    glEnd()
+    glLineWidth(1.0)
+
+
+def draw_feature_run_paths(attempts):
+    true_points = [_pose_to_render_position(attempt["true_pose"])
+                   for attempt in attempts]
+    draw_world_polyline(true_points, (0.0, 0.28, 1.0), width=3.0)
+
+    current_segment = []
     for attempt in attempts:
+        if attempt["success"] and attempt.get("estimated_pose") is not None:
+            current_segment.append(_pose_to_render_position(attempt["estimated_pose"]))
+        else:
+            draw_world_polyline(current_segment, (0.0, 1.0, 0.18), width=3.0)
+            current_segment = []
+    draw_world_polyline(current_segment, (0.0, 1.0, 0.18), width=3.0)
+
+
+def draw_feature_run_attempts(attempts):
+    global feature_current_pair_index
+    draw_feature_run_paths(attempts)
+    for index, attempt in enumerate(attempts):
         true_pose = attempt["true_pose"]
         draw_camera_pyramid(*true_pose)
         if attempt["success"] and attempt.get("estimated_pose") is not None:
@@ -1234,6 +1308,9 @@ def draw_feature_run_attempts(attempts):
         elif not attempt["success"]:
             draw_sphere(-true_pose[0], -true_pose[1], -true_pose[2],
                         color=(1.0, 0.0, 0.0), radius=1.6)
+        if index == feature_current_pair_index:
+            draw_sphere(-true_pose[0], -true_pose[1], -true_pose[2],
+                        color=(1.0, 1.0, 0.0), radius=2.2)
 
 
 def draw_tracker_sphere(x, y, z, r=0.0, g=1.0, b=0.2):

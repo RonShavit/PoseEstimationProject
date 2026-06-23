@@ -60,12 +60,20 @@ def validate_metadata(metadata, map_profile, map_shape, view_size):
     expected = build_metadata(map_profile, map_shape, view_size)
     checks = [
         ("schema_version", metadata.get("schema_version"), SCHEMA_VERSION),
+        ("map_filename", metadata.get("map_filename"), expected["map_filename"]),
         ("map_stem", metadata.get("map_stem"), expected["map_stem"]),
         ("map_dimensions", metadata.get("map_dimensions"), expected["map_dimensions"]),
         ("detector_name", metadata.get("detector_name"), DETECTOR_NAME),
         ("camera_fov_degrees", metadata.get("camera_fov_degrees"), 45),
+        ("view_resolution", metadata.get("view_resolution"), expected["view_resolution"]),
         ("terrain_margin", metadata.get("terrain_margin"), expected["terrain_margin"]),
     ]
+    if metadata.get("color_map_path") or expected.get("color_map_path"):
+        checks.append((
+            "color_map_path",
+            metadata.get("color_map_path"),
+            expected.get("color_map_path"),
+        ))
     errors = []
     for name, got, want in checks:
         if got != want:
