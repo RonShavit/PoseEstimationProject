@@ -7,13 +7,18 @@ import math
 import cv2
 import numpy as np
 import ctypes
-import random
+import argparse
 from read_config import read_config
 from trackers import get_trackers_from_file
 from color_picking import find_blob_centers
+from feature_database import (
+    FeatureDatabase,
+    active_database_path,
+    load_active_database,
+)
+from feature_matching import detect_sift_features, match_query_to_database
 import sys
 import os
-import tqdm
 
 
 MAP_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
@@ -748,305 +753,188 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
 
 
 # ---------------------------------------------------------------------------
-# Feature-matching pose estimation (SIFT detection + FLANN matching)
+# Feature Pre / Feature Run helpers
 # ---------------------------------------------------------------------------
-# Startup learns a database of SIFT descriptors, each tagged with the 3D world
-# point it corresponds to, by rendering the terrain from several reference
-# viewpoints and unprojecting every keypoint against that view's depth buffer.
-# At estimation time the query screenshot is SIFT-matched (FLANN + Lowe ratio
-# test) against this database to recover 2D-3D correspondences, which the
-# existing solve_pnp() turns into a camera pose.
-#
-# This is entirely self-contained to feature mode and does not touch the
-# trackers/picking estimation paths.
 
-_FEATURE_DB = {
-    "descriptors": None,   # (N, 128) float32 stacked SIFT descriptors
-    "points3d":    None,   # (N, 3)   float32 world points, parallel to descriptors
-    "sift":        None,   # cv2.SIFT detector instance
-    "flann":       None,   # cv2.FlannBasedMatcher instance
-    "ready":       False,
-}
+FEATURE_PRE_LIGHTING = "pre"
+FEATURE_RUN_LIGHTING = "run"
 
 
-def _make_sift():
-    """Create a SIFT detector, raising a clear error if unavailable."""
-    if not hasattr(cv2, "SIFT_create"):
-        raise RuntimeError(
-            "cv2.SIFT_create not available - install opencv-contrib-python "
-            "or a recent opencv-python (>=4.4).")
-    return cv2.SIFT_create()
-
-
-def _make_flann():
-    """FLANN matcher configured for SIFT's float descriptors (KD-tree)."""
-    FLANN_INDEX_KDTREE = 1
-    index_params  = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
-    return cv2.FlannBasedMatcher(index_params, search_params)
-
-
-def _terrain_world_bounds():
-    """
-    Compute the terrain's world-space bounding box from the actual mesh data
-    (the .tri vertices), returning (min_xyz, max_xyz, center) as numpy arrays.
-
-    Vertices are produced by image_to_tris as (x/margin, height, z/margin), so
-    this reflects the real extent of the world rather than image dimensions.
-    """
-    verts = tm.read_tri_map(ACTIVE_MAP["tri_path"])
-    xs, ys, zs = [], [], []
-    for t in verts:
-        for v in (t.v1, t.v2, t.v3):
-            xs.append(v.x); ys.append(v.y); zs.append(v.z)
-    mn = np.array([min(xs), min(ys), min(zs)], dtype=np.float64)
-    mx = np.array([max(xs), max(ys), max(zs)], dtype=np.float64)
-    return mn, mx, (mn + mx) / 2.0
-
-
-def _look_at_pose(cam_world, target_world):
-    """
-    Build a render pose that places the camera at `cam_world` looking at
-    `target_world`, in the renderer's convention.
-
-    The modelview is R·T(c) with R = Ry(yaw)·Rx(pitch)·Rz(0), so a world point
-    maps to eye space as R·(X + c); the camera's world position is therefore
-    -c. The world-space forward direction is f = (sin yaw, -sin pitch cos yaw,
-    -cos pitch cos yaw), which inverts to:
-        yaw   = asin(f.x)
-        pitch = atan2(-f.y, -f.z)
-    (verified exact for any look-at direction around the terrain).
-    Returns (c_x, c_y, c_z, r_x, r_y, r_z).
-    """
-    cam_world = np.asarray(cam_world, dtype=np.float64)
-    f = np.asarray(target_world, dtype=np.float64) - cam_world
-    n = np.linalg.norm(f)
-    if n < 1e-9:
-        f = np.array([0.0, 0.0, -1.0])
+def apply_feature_lighting_bgr(bgr, profile):
+    img = bgr.astype(np.float32)
+    if profile == FEATURE_RUN_LIGHTING:
+        img[:, :, 0] *= 1.15
+        img[:, :, 1] *= 0.86
+        img[:, :, 2] *= 0.62
+        img *= 0.72
     else:
-        f = f / n
-    fx, fy, fz = float(f[0]), float(f[1]), float(f[2])
-    yaw   = math.degrees(math.asin(max(-1.0, min(1.0, fx))))
-    pitch = math.degrees(math.atan2(-fy, -fz))
-    # Camera world position is the negation of the translate term.
-    c_x, c_y, c_z = -cam_world[0], -cam_world[1], -cam_world[2]
-    return (float(c_x), float(c_y), float(c_z),
-            float(pitch), float(yaw), 0.0)
+        img = img * 1.05 + 6.0
+    return np.clip(img, 0, 255).astype(np.uint8)
 
 
-def _reference_viewpoints():
-    """
-    Generate N RANDOM reference camera poses, each positioned around/above the
-    terrain and aimed so it looks generally at the world.
-
-    Uses the real terrain bounds (from the mesh data) to size the sampling
-    region, so the views adapt to whatever world is loaded. Configurable via
-    CONFIG keys (all optional):
-        feature_ref_count        : number of random viewpoints (default 12)
-        feature_ref_seed         : RNG seed; use null/None for a fresh random
-                                   set each run (default 0 for reproducibility)
-        feature_ref_height_scale : extra camera height as a fraction of the
-                                   terrain's XZ span (default 0.6)
-        feature_ref_dist_scale   : camera distance from centre as a fraction of
-                                   the terrain's XZ span, [min, max]
-                                   (default [0.6, 1.2])
-    Returns a list of (c_x, c_y, c_z, r_x, r_y, r_z).
-    """
-    mn, mx, center = _terrain_world_bounds()
-    span_xz = float(max(mx[0] - mn[0], mx[2] - mn[2]))
-    top_y   = float(mx[1])
-
-    n          = int(CONFIG.get("feature_ref_count", 12))
-    seed       = CONFIG.get("feature_ref_seed", 0)   # None -> non-deterministic
-    h_scale    = float(CONFIG.get("feature_ref_height_scale", 0.6))
-    dist_lo, dist_hi = CONFIG.get("feature_ref_dist_scale", [0.6, 1.2])
-
-    rng = random.Random(seed)
-    poses = []
-    for _ in range(n):
-        # Random horizontal direction and distance around the terrain centre.
-        ang  = rng.uniform(0.0, 2.0 * math.pi)
-        dist = rng.uniform(dist_lo, dist_hi) * span_xz
-        # Random height above the terrain top, scaled to the world size.
-        height = top_y + rng.uniform(0.3, 1.0) * h_scale * span_xz
-
-        cam_world = np.array([
-            center[0] + math.cos(ang) * dist,
-            height,
-            center[2] + math.sin(ang) * dist,
-        ], dtype=np.float64)
-
-        # Aim at a random point near the terrain centre so views vary slightly
-        # rather than all converging on the exact midpoint.
-        jitter = 0.15 * span_xz
-        target = np.array([
-            center[0] + rng.uniform(-jitter, jitter),
-            center[1] + rng.uniform(-jitter, jitter) * 0.3,
-            center[2] + rng.uniform(-jitter, jitter),
-        ], dtype=np.float64)
-
-        poses.append(_look_at_pose(cam_world, target))
-    return poses
+def draw_feature_lighting_overlay(profile, viewport_x, viewport_y, view_w, view_h):
+    if profile != FEATURE_RUN_LIGHTING:
+        return
+    glViewport(viewport_x, viewport_y, view_w, view_h)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, view_w, view_h, 0, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glColor4f(0.05, 0.11, 0.28, 0.35)
+    glBegin(GL_QUADS)
+    glVertex2f(0, 0); glVertex2f(view_w, 0)
+    glVertex2f(view_w, view_h); glVertex2f(0, view_h)
+    glEnd()
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
 
 
-def _render_reference_view(view_w, view_h, pose):
-    """
-    Render the terrain into the left viewport from `pose`, returning
-    (bgr_image, modelview, projection, viewport).
+def read_viewport_bgr(x, y, view_w, view_h, buffer=GL_FRONT, lighting_profile=None):
+    glReadBuffer(buffer)
+    pixels = glReadPixels(x, y, view_w, view_h, GL_RGB, GL_UNSIGNED_BYTE)
+    arr = np.frombuffer(pixels, dtype=np.uint8).reshape((view_h, view_w, 3))
+    arr = np.flipud(arr)
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    if lighting_profile:
+        bgr = apply_feature_lighting_bgr(bgr, lighting_profile)
+    return bgr
 
-    Uses the SAME canonical-axis camera convention as render_scene's left view
-    so unprojected keypoints land on the terrain consistently.
-    """
+
+def render_pose_to_bgr(view_w, view_h, pose, lighting_profile=FEATURE_PRE_LIGHTING):
     cx, cy, cz, rx, ry, rz = pose
-
     glViewport(0, 0, view_w, view_h)
     glMatrixMode(GL_PROJECTION); glLoadIdentity()
     gluPerspective(45, view_w / view_h, NEAR, FAR)
     glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     draw_gradient_background()
-
-    glLoadIdentity()
     glRotatef(ry, 0, 1, 0)
     glRotatef(rx, 1, 0, 0)
     glRotatef(rz, 0, 0, 1)
     glTranslatef(cx, cy, cz)
     draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
-
-    modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
-    projection = glGetDoublev(GL_PROJECTION_MATRIX)
-    viewport   = glGetIntegerv(GL_VIEWPORT)
-
-    glReadBuffer(GL_BACK)
-    pixels = glReadPixels(0, 0, view_w, view_h, GL_RGB, GL_UNSIGNED_BYTE)
-    arr = np.frombuffer(pixels, dtype=np.uint8).reshape((view_h, view_w, 3))
-    arr = np.flipud(arr)                       # OpenGL origin is bottom-left
-    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    return bgr, modelview, projection, viewport
+    return read_viewport_bgr(0, 0, view_w, view_h, buffer=GL_BACK,
+                             lighting_profile=lighting_profile)
 
 
-def _unproject_keypoint(kp_x, kp_y, view_h, modelview, projection, viewport):
-    """
-    Unproject an image-space keypoint (origin top-left, as in cv2/pixels) to a
-    3D world point using the given view's depth buffer. Returns None if the
-    keypoint falls on the background (no terrain).
-    """
-    real_y = view_h - kp_y                     # flip to GL bottom-left origin
-    depth  = glReadPixels(int(round(kp_x)), int(round(real_y)),
-                          1, 1, GL_DEPTH_COMPONENT, GL_FLOAT)
-    depth_value = float(depth[0][0])
-    if depth_value >= 1.0:
-        return None                            # background pixel
-    wx, wy, wz = gluUnProject(kp_x, real_y, depth_value,
-                              modelview, projection, viewport)
-    return (wx, wy, wz)
+def render_view_matrix_to_bgr(view_w, view_h, view_mat,
+                              lighting_profile=FEATURE_RUN_LIGHTING):
+    glViewport(0, 0, view_w, view_h)
+    glMatrixMode(GL_PROJECTION); glLoadIdentity()
+    gluPerspective(45, view_w / view_h, NEAR, FAR)
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity()
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    draw_gradient_background()
+    glLoadMatrixd(view_mat)
+    draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
+    return read_viewport_bgr(0, 0, view_w, view_h, buffer=GL_BACK,
+                             lighting_profile=lighting_profile)
 
 
-def build_feature_database(view_w, view_h):
-    """
-    Startup stage: render the terrain from several reference viewpoints, detect
-    SIFT features in each, unproject them to 3D, and assemble a descriptor +
-    3D-point database with a FLANN matcher ready for queries.
-
-    Renders to the BACK buffer and does NOT flip, so it leaves nothing visible;
-    the normal draw loop repaints afterwards.
-    """
-    sift = _make_sift()
-    descriptors_all = []
-    points3d_all    = []
-
-    poses = _reference_viewpoints()
-    print(f"[features] learning from {len(poses)} reference viewpoint(s)...")
-
-    for i, pose in tqdm.tqdm(enumerate(poses), desc="[features] rendering & detecting",
-                             total=len(poses), unit="view"):
-        bgr, modelview, projection, viewport = _render_reference_view(
-            view_w, view_h, pose)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        kps, desc = sift.detectAndCompute(gray, None)
-        if desc is None or len(kps) == 0:
-            continue
-        kept = 0
-        for kp, d in zip(kps, desc):
-            p3d = _unproject_keypoint(kp.pt[0], kp.pt[1], view_h,
-                                      modelview, projection, viewport)
-            if p3d is None:
-                continue                       # keypoint on background sky
-            descriptors_all.append(d)
-            points3d_all.append(p3d)
-            kept += 1
-        #print(f"[features]   view {i+1}/{len(poses)} "
-        #      f"(yaw={pose[4]:.0f}, pitch={pose[3]:.0f}): "
-        #      f"{len(kps)} keypoints, {kept} mapped to terrain")
-
-    if not descriptors_all:
-        print("[features] WARNING: no features learned - database empty.")
-        _FEATURE_DB["ready"] = False
+def draw_bgr_image_in_view(bgr, viewport_x, viewport_y, view_w, view_h):
+    if bgr is None:
         return
+    img = cv2.resize(bgr, (view_w, view_h), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    rgb = np.flipud(rgb).copy()
+    glViewport(viewport_x, viewport_y, view_w, view_h)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, view_w, 0, view_h, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    glRasterPos2i(0, 0)
+    glDrawPixels(view_w, view_h, GL_RGB, GL_UNSIGNED_BYTE, rgb)
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
 
-    _FEATURE_DB["descriptors"] = np.asarray(descriptors_all, dtype=np.float32)
-    _FEATURE_DB["points3d"]    = np.asarray(points3d_all,    dtype=np.float32)
-    _FEATURE_DB["sift"]        = sift
-    _FEATURE_DB["flann"]       = _make_flann()
-    _FEATURE_DB["flann"].add([_FEATURE_DB["descriptors"]])
-    _FEATURE_DB["flann"].train()
-    _FEATURE_DB["ready"]       = True
-    print(f"[features] database ready: {_FEATURE_DB['descriptors'].shape[0]} "
-          f"descriptors mapped to 3D.")
+
+def feature_view_matrix_from_pnp(R, tvec):
+    ext = np.eye(4, dtype=np.float64)
+    ext[:3, :3] = R
+    ext[:3, 3] = np.asarray(tvec, dtype=np.float64).flatten()
+    flip = np.diag([1.0, -1.0, -1.0, 1.0])
+    return (flip @ ext).T.flatten().astype(np.float64).tolist()
 
 
-def estimate_pose_from_features(query_bgr, view_w, view_h,
-                                ratio=0.7, min_matches=6, actual_cam=None):
-    """
-    Solver stage: SIFT-detect on the query image, FLANN-match against the
-    learned database with Lowe's ratio test, build 2D-3D correspondences, and
-    run the existing solve_pnp.
+def solve_pnp_feature(correspondences, view_w, view_h, actual_cam):
+    result = {
+        "success": False,
+        "failure_reason": None,
+        "estimated_pose": None,
+        "R": None,
+        "tvec": None,
+        "view_matrix": None,
+        "pnp_inlier_count": None,
+        "reprojection_error": None,
+        "position_error": None,
+        "rotation_error": None,
+    }
+    if len(correspondences) < 4:
+        result["failure_reason"] = (
+            f"not enough matches for PnP ({len(correspondences)} < 4)"
+        )
+        return result
 
-    Returns (cam_pos, euler, R, tvec) on success, or None on failure (caller
-    falls back to the placeholder).
-    """
-    if not _FEATURE_DB["ready"]:
-        print("[features] database not ready - run startup learning first.")
-        return None
-
-    sift  = _FEATURE_DB["sift"]
-    flann = _FEATURE_DB["flann"]
-    pts3d = _FEATURE_DB["points3d"]
-
-    gray = cv2.cvtColor(query_bgr, cv2.COLOR_BGR2GRAY)
-    kps_q, desc_q = sift.detectAndCompute(gray, None)
-    if desc_q is None or len(kps_q) < 2:
-        print("[features] too few keypoints in query image.")
-        return None
-
-    # k-NN match query descriptors against the database, then Lowe ratio test.
-    knn = flann.knnMatch(desc_q, k=2)
-    correspondences = []
-    for pair in knn:
-        if len(pair) < 2:
-            continue
-        m, n = pair
-        if m.distance < ratio * n.distance:
-            q_pt = kps_q[m.queryIdx].pt          # 2D in query image (top-left origin)
-            w_pt = pts3d[m.trainIdx]             # 3D world point from database
-            correspondences.append(((float(q_pt[0]), float(q_pt[1])),
-                                    (float(w_pt[0]), float(w_pt[1]), float(w_pt[2]))))
-
-    print(f"[features] {len(kps_q)} query keypoints, "
-          f"{len(correspondences)} good matches after ratio test.")
-    if len(correspondences) < min_matches:
-        print(f"[features] not enough matches "
-              f"({len(correspondences)} < {min_matches}) - estimation aborted.")
-        return None
-
-    # solve_pnp expects 2D in the same pixel frame as the query (top-left origin,
-    # view_w x view_h), which is exactly what the screenshot keypoints use.
-    ok, cam_pos, euler, R, tvec = solve_pnp(correspondences,view_w,view_h,actual_cam=actual_cam)
+    K = build_camera_intrinsics(view_w, view_h)
+    dist = np.zeros((4, 1))
+    pts3d = np.array([[w[0], w[1], w[2]] for (_, w) in correspondences],
+                     dtype=np.float64)
+    pts2d = np.array([[p[0], p[1]] for (p, _) in correspondences],
+                     dtype=np.float64)
+    try:
+        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+            pts3d, pts2d, K, dist, flags=cv2.SOLVEPNP_EPNP)
+    except cv2.error as exc:
+        ok = False
+        inliers = None
+        result["failure_reason"] = exc.msg.splitlines()[0]
     if not ok:
-        print("[features] solve_pnp failed on feature correspondences.")
-        return None
-    return cam_pos, euler, R, tvec
+        rvec, tvec = _try_solvers(
+            pts3d, pts2d, K, dist,
+            [(cv2.SOLVEPNP_EPNP, "EPNP"), (cv2.SOLVEPNP_IPPE, "IPPE")])
+    if rvec is None:
+        result["failure_reason"] = result["failure_reason"] or "solvePnP failed"
+        return result
+
+    try:
+        cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
+    except cv2.error:
+        pass
+
+    R, _ = cv2.Rodrigues(rvec)
+    proj, _ = cv2.projectPoints(pts3d, rvec, tvec, K, dist)
+    reproj_err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1)))
+    cam_pos = (-R.T @ tvec).flatten()
+    estimated_pose = (
+        float(-cam_pos[0]), float(-cam_pos[1]), float(-cam_pos[2]),
+        *tuple(float(v) for v in render_euler_from_pnp_R(R)),
+    )
+    ax, ay, az, arx, ary, arz = actual_cam
+    pos_err = math.sqrt((cam_pos[0] + ax) ** 2 +
+                        (cam_pos[1] + ay) ** 2 +
+                        (cam_pos[2] + az) ** 2)
+    view_mat = feature_view_matrix_from_pnp(R, tvec)
+    rot_err = rotation_geodesic_error(
+        gl_rotation_from_view_matrix(view_mat), arx, ary, arz)
+    result.update({
+        "success": True,
+        "estimated_pose": estimated_pose,
+        "R": R,
+        "tvec": tvec,
+        "view_matrix": view_mat,
+        "pnp_inlier_count": int(len(inliers)) if inliers is not None else None,
+        "reprojection_error": reproj_err,
+        "position_error": float(pos_err),
+        "rotation_error": float(rot_err),
+    })
+    return result
 
 
 
@@ -1269,6 +1157,85 @@ def draw_right_image_points_2d(correspondences):
     glMatrixMode(GL_MODELVIEW)
 
 
+def draw_feature_pre_world_points():
+    if feature_pre_db is None:
+        return
+    points = [mapping["world_point"] for mapping in feature_pre_db.mappings]
+    if not points:
+        return
+    width, height = pygame.display.get_surface().get_size()
+    setup_left_view_matrices(width, height)
+    viewport = glGetIntegerv(GL_VIEWPORT)
+    modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+    projection = glGetDoublev(GL_PROJECTION_MATRIX)
+    projected = []
+    for point in points:
+        sx, sy, sz = gluProject(point[0], point[1], point[2],
+                                modelview, projection, viewport)
+        if 0.0 <= sz <= 1.0:
+            projected.append((sx, height - sy))
+    glViewport(0, 0, width, height)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, width, height, 0, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    for point in projected:
+        draw_2d_pick_dot(point, color=(1.0, 0.0, 0.0), radius=4)
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+def draw_feature_pre_keypoints_2d():
+    if feature_pre_db is None or not feature_pre_db.views:
+        return
+    view = feature_pre_db.views[feature_pre_active_index]
+    width, height = pygame.display.get_surface().get_size()
+    half_w = width // 2
+    mapped_ids = feature_pre_db.mapped_keypoint_ids(view.view_id)
+    pending_id = None
+    if feature_pre_pending and feature_pre_pending["view_id"] == view.view_id:
+        pending_id = feature_pre_pending["keypoint_id"]
+
+    glViewport(0, 0, width, height)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, width, height, 0, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    glLineWidth(2.0)
+    if feature_pre_show_keypoints:
+        glColor3f(0.0, 0.55, 0.75)
+        for x, y in view.keypoints:
+            draw_2d_pick_dot((half_w + float(x), float(y)),
+                             color=(0.0, 0.55, 0.75), radius=2.5)
+    for keypoint_id in mapped_ids:
+        if keypoint_id < len(view.keypoints):
+            draw_2d_pick_marker((half_w + float(view.keypoints[keypoint_id][0]),
+                                 float(view.keypoints[keypoint_id][1])),
+                                (0.1, 1.0, 0.2), size=6)
+    if pending_id is not None and pending_id < len(view.keypoints):
+        draw_2d_pick_marker((half_w + float(view.keypoints[pending_id][0]),
+                             float(view.keypoints[pending_id][1])),
+                            (1.0, 1.0, 0.0), size=9)
+    glLineWidth(1.0)
+    glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+def draw_feature_run_attempts(attempts):
+    for attempt in attempts:
+        true_pose = attempt["true_pose"]
+        draw_camera_pyramid(*true_pose)
+        if attempt["success"] and attempt.get("estimated_pose") is not None:
+            draw_tracker_cam_pairs([(true_pose, attempt["estimated_pose"])])
+        elif not attempt["success"]:
+            draw_sphere(-true_pose[0], -true_pose[1], -true_pose[2],
+                        color=(1.0, 0.0, 0.0), radius=1.6)
+
+
 def draw_tracker_sphere(x, y, z, r=0.0, g=1.0, b=0.2):
     """Draw a sphere at (x,y,z) with the given RGB colour and TRACKER_RADIUS."""
     glPushMatrix()
@@ -1329,7 +1296,7 @@ def draw_tracker_cam_pairs(pairs):
 # Scene rendering
 # ---------------------------------------------------------------------------
 def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
-                 feature_mode=False):
+                 feature_mode=False, feature_pre_mode=False):
     global CONFIG, ACTIVE_MAP
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
@@ -1338,6 +1305,7 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
     global tracker_points, tracker_cam_pairs
     global tracker_overlay_active, tracker_current_pair_index
     global feature_cam_pairs, feature_overlay_active, feature_current_pair_index
+    global feature_run_attempts
 
     r_speed   = 0.1
     rot_speed = 0.5
@@ -1347,9 +1315,9 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
     rx =  math.cos(r_y * math.pi / 180)
     rz =  math.sin(r_y * math.pi / 180)
 
-    if apply_input and (not picking_mode or trackers_mode or feature_mode):
+    if apply_input and (not picking_mode or trackers_mode or feature_mode or feature_pre_mode):
         keys_pressed = pygame.key.get_pressed()
-        if recording_mode or trackers_mode or feature_mode:
+        if recording_mode or trackers_mode or feature_mode or feature_pre_mode:
             moved = False
             yaw_delta = 0.0
             if keys_pressed[K_LEFT]:   yaw_delta -= rot_speed;  moved = True
@@ -1396,8 +1364,9 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
             c_x, c_y, c_z, r_x, r_y, r_z = saved_positions[recording_index]
 
     elif not apply_input and not picking_mode:
-        c_x, c_y, c_z = c_x2, c_y2, c_z2
-        r_x, r_y, r_z = r_x2, r_y2, r_z2
+        if not feature_pre_mode:
+            c_x, c_y, c_z = c_x2, c_y2, c_z2
+            r_x, r_y, r_z = r_x2, r_y2, r_z2
         if trackers_mode and tracker_cam_pairs:
             # In trackers mode the right view shows actual(blue) & estimated(green) pyramids
             for pos in tracker_cam_pairs:
@@ -1407,14 +1376,14 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
                 draw_tracker_cam_pairs([pos])
                 glPopMatrix()
-        elif feature_mode and feature_cam_pairs:
-            # In feature mode the right view shows actual(blue) & estimated(green) pyramids
-            for pos in feature_cam_pairs:
+        elif feature_mode and feature_run_attempts:
+            # In feature mode the right view shows true, estimated, and failure path markers.
+            for pos in feature_run_attempts:
                 glPushMatrix()
                 glLoadIdentity()
                 glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
                 glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
-                draw_tracker_cam_pairs([pos])
+                draw_feature_run_attempts([pos])
                 glPopMatrix()
         elif not trackers_mode and not feature_mode:
             for pos in saved_positions:
@@ -1449,7 +1418,8 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
 # ---------------------------------------------------------------------------
 # Main draw (split-screen)
 # ---------------------------------------------------------------------------
-def draw(recording_mode, trackers_mode=False, feature_mode=False):
+def draw(recording_mode, trackers_mode=False, feature_mode=False,
+         feature_pre_mode=False):
     global picking_mode, pnp_result, picked_correspondences
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
@@ -1457,6 +1427,8 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
     global tracker_est_view_mats
     global feature_cam_pairs, feature_overlay_active, feature_current_pair_index
     global feature_est_view_mats
+    global feature_run_attempts, feature_diff_mode
+    global feature_pre_db, feature_pre_active_index
     try:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     except Exception as e:
@@ -1472,9 +1444,14 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
     glMatrixMode(GL_MODELVIEW)
     draw_gradient_background()
     render_scene(apply_input=True, recording_mode=recording_mode,
-                 trackers_mode=trackers_mode, feature_mode=feature_mode)
+                 trackers_mode=trackers_mode, feature_mode=feature_mode,
+                 feature_pre_mode=feature_pre_mode)
+    if feature_mode:
+        draw_feature_lighting_overlay(FEATURE_RUN_LIGHTING, 0, 0, width // 2, height)
     if picking_mode:
         draw_left_world_pick_markers(picked_points, pending_left_world_point)
+    if feature_pre_mode:
+        draw_feature_pre_world_points()
 
     # Tracker overlay on left view: atop the real-position camera view (drawn
     # above by render_scene), overlay the camera view from the estimated
@@ -1529,39 +1506,38 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
 
     # Feature-matching overlay on left view: identical treatment to the tracker
     # overlay, but driven by the feature-mode pairs/matrices.
-    if (feature_mode and feature_overlay_active and feature_cam_pairs
+    if (feature_mode and feature_overlay_active and feature_run_attempts
             and feature_current_pair_index in feature_est_view_mats):
         view_mat = feature_est_view_mats[feature_current_pair_index]
+        attempt = feature_run_attempts[feature_current_pair_index]
 
-        glViewport(0, 0, width // 2, height)
-        glMatrixMode(GL_PROJECTION); glLoadIdentity()
-        gluPerspective(45, (width / 2) / height, NEAR, FAR)
-        glMatrixMode(GL_MODELVIEW)
+        if feature_diff_mode and attempt.get("diff_image") is not None:
+            draw_bgr_image_in_view(attempt["diff_image"], 0, 0, width // 2, height)
+            draw_text_2d("absolute difference", 12, 10, color=(255, 230, 120))
+        else:
 
-        glDisable(GL_DEPTH_TEST)
-        glDepthMask(GL_FALSE)
-        glEnable(GL_BLEND)
-        glBlendColor(0.0, 0.0, 0.0, 0.36)
-        glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA)
+            glViewport(0, 0, width // 2, height)
+            glMatrixMode(GL_PROJECTION); glLoadIdentity()
+            gluPerspective(45, (width / 2) / height, NEAR, FAR)
+            glMatrixMode(GL_MODELVIEW)
 
-        glLoadMatrixd(view_mat)
-        draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
+            glDisable(GL_DEPTH_TEST)
+            glDepthMask(GL_FALSE)
+            glEnable(GL_BLEND)
+            glBlendColor(0.0, 0.0, 0.0, 0.36)
+            glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA)
 
-        glDisable(GL_BLEND)
-        glDepthMask(GL_TRUE)
-        glEnable(GL_DEPTH_TEST)
+            glLoadMatrixd(view_mat)
+            draw_terrain_vbo(terrain_vbo, terrain_vertex_count)
+
+            glDisable(GL_BLEND)
+            glDepthMask(GL_TRUE)
+            glEnable(GL_DEPTH_TEST)
 
         # Show the saved pair's position/rotation error in the top-left corner.
-        real_cam, est_cam = feature_cam_pairs[feature_current_pair_index]
-        f_pos_err = math.sqrt((est_cam[0] - real_cam[0]) ** 2 +
-                              (est_cam[1] - real_cam[1]) ** 2 +
-                              (est_cam[2] - real_cam[2]) ** 2)
-        f_rot_err = rotation_geodesic_error(
-            gl_rotation_from_view_matrix(view_mat),
-            real_cam[3], real_cam[4], real_cam[5])
-        draw_text_2d(f"pos err: {f_pos_err:.2f} units", 12, 34,
+        draw_text_2d(f"pos err: {attempt['position_error']:.2f} units", 12, 34,
                      color=(255, 230, 120))
-        draw_text_2d(f"rot err: {f_rot_err:.2f} deg", 12, 58,
+        draw_text_2d(f"rot err: {attempt['rotation_error']:.2f} deg", 12, 58,
                      color=(255, 230, 120))
 
     glViewport(width // 2, 0, width // 2, height)
@@ -1573,9 +1549,17 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
     old_cam = (c_x, c_y, c_z, r_x, r_y, r_z)
     c_x, c_y, c_z = c_x2, c_y2, c_z2
     r_x, r_y, r_z = r_x2, r_y2, r_z2
+    if feature_pre_mode and feature_pre_db and feature_pre_db.views:
+        c_x, c_y, c_z, r_x, r_y, r_z = feature_pre_db.views[feature_pre_active_index].pose
     render_scene(apply_input=False, recording_mode=recording_mode,
-                 trackers_mode=trackers_mode, feature_mode=feature_mode)
+                 trackers_mode=trackers_mode, feature_mode=feature_mode,
+                 feature_pre_mode=feature_pre_mode)
+    if feature_mode:
+        draw_feature_lighting_overlay(FEATURE_RUN_LIGHTING,
+                                      width // 2, 0, width // 2, height)
     c_x, c_y, c_z, r_x, r_y, r_z = old_cam
+    if feature_pre_mode:
+        draw_feature_pre_keypoints_2d()
 
     # Picking-mode overlay on the RIGHT view: atop the right-position camera
     # view, overlay the terrain as seen from the PnP-estimated camera at 36%
@@ -1638,21 +1622,309 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False):
         draw_text_2d("PICKING MODE", 12, height - 28, color=(255, 100, 100))
     elif trackers_mode:
         draw_text_2d("TRACKERS MODE", 12, height - 28, color=(200, 200, 200))
+    elif feature_pre_mode:
+        mode_label = "FEATURE PRE DEMO" if feature_pre_demo else "FEATURE PRE EDIT"
+        if feature_pre_db and feature_pre_db.views:
+            view = feature_pre_db.views[feature_pre_active_index]
+            mode_label += (
+                f" | view {feature_pre_active_index + 1}/{feature_pre_db.view_count()}"
+                f" | mapped {view.mapped_count(feature_pre_db.mappings)}"
+            )
+        draw_text_2d(mode_label, 12, height - 28, color=(255, 255, 100))
     elif recording_mode:
         
         draw_text_2d("RECORDING MODE", 12, height - 28, color=(100, 100, 255))
     elif feature_mode:
-        draw_text_2d("2D FEATURE MATCHING MODE", 12, height - 28, color=(255, 255, 100))
+        label = "FEATURE RUN"
+        if feature_run_attempts:
+            attempt = feature_run_attempts[feature_current_pair_index]
+            status = "OK" if attempt["success"] else "FAILED"
+            label += f" {feature_current_pair_index + 1}/{len(feature_run_attempts)} {status}"
+        draw_text_2d(label, 12, height - 28, color=(255, 255, 100))
+        if feature_run_attempts:
+            attempt = feature_run_attempts[feature_current_pair_index]
+            if attempt["success"]:
+                draw_text_2d(
+                    f"matches {attempt['good_descriptor_match_count']} | inliers {attempt['pnp_inlier_count']}",
+                    12, height - 54, color=(255, 230, 120))
+            else:
+                draw_text_2d("FEATURE MATCHING FAILED", 12, height - 54,
+                             color=(255, 80, 80))
+                draw_text_2d(str(attempt["failure_reason"]), 12, height - 80,
+                             color=(255, 170, 170))
     else:
         draw_text_2d("VIEWING MODE", 12, height - 28, color=(100, 255, 100))
     draw_seperator_line()
     pygame.display.flip()
 
 
+def update_window_caption(mode):
+    if mode == "pre":
+        if feature_pre_demo:
+            caption = (
+                "Feature Pre [DEMO - READ ONLY] | WASD/Arrows - move 3D view | "
+                "V - new temporary view | [/] - browse temporary views | H - keypoints | "
+                "Right click - feature | Left click - 3D match | U - undo | Esc - exit | "
+                "Saving disabled"
+            )
+        else:
+            caption = (
+                "Feature Pre [EDIT] | WASD/Arrows - move 3D view | V - new view | "
+                "[/] - browse views | H - keypoints | Right click - feature | "
+                "Left click - 3D match | U - undo | Ctrl+S - save | "
+                "Ctrl+Shift+S - snapshot | Esc - exit"
+            )
+    elif feature_mode:
+        attempt_info = (
+            f" | Attempt {feature_current_pair_index + 1}/{len(feature_run_attempts)}"
+            if feature_run_attempts else ""
+        )
+        caption = (
+            "Feature Run | WASD/Arrows - move | B - estimate pose | "
+            "N/M - browse attempts | D - overlay/diff | F - exit feature run"
+            f"{attempt_info}"
+        )
+    elif trackers_mode:
+        pair_info = (
+            f" | Pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)}"
+            if tracker_cam_pairs else ""
+        )
+        caption = (
+            "Trackers Mode | WASD/Arrows - move | B - estimate | "
+            f"N/M - browse pairs{pair_info} | P - picking | R - recording"
+        )
+    elif picking_mode:
+        caption = (
+            "Picking Mode | Left click - 3D point | Right view click - 2D match | "
+            "C - solve PnP | R - recording | T - trackers"
+        )
+    elif recording_mode:
+        caption = (
+            "Recording Mode | WASD/Arrows - move | B - save pose | "
+            "R - navigation | P - picking | T - trackers | F - feature run"
+        )
+    else:
+        caption = (
+            "Navigation Mode | R - recording | P - picking | "
+            "T - trackers | F - feature run"
+        )
+    pygame.display.set_caption(caption)
+
+
+def select_feature_pre_action(map_name):
+    active_path = active_database_path(map_name)
+    has_active = os.path.exists(active_path)
+    print(f"\nFeature Pre Mode for: {map_name}\n")
+    if not has_active:
+        print("No active feature database exists for this map.")
+    print("1. Continue / edit existing active database")
+    print("2. Create a new empty database")
+    print("3. Demo mode - temporary, read-only, never saves")
+    print("4. Cancel")
+    while True:
+        choice = input("\nEnter selection: ").strip()
+        if choice == "1":
+            if has_active:
+                return "continue"
+            print("No active database to continue. Choose 2 for a new database or 3 for demo.")
+        elif choice == "2":
+            return "new"
+        elif choice == "3":
+            return "demo"
+        elif choice == "4":
+            return "cancel"
+        else:
+            print("Invalid selection. Enter 1, 2, 3, or 4.")
+
+
+def create_feature_reference_view(view_w, view_h):
+    global feature_pre_active_index, feature_pre_pending
+    pose = (c_x, c_y, c_z, r_x, r_y, r_z)
+    bgr = render_pose_to_bgr(view_w, view_h, pose, FEATURE_PRE_LIGHTING)
+    keypoints, descriptors = detect_sift_features(bgr)
+    view = feature_pre_db.add_reference_view(pose, keypoints, descriptors)
+    feature_pre_active_index = feature_pre_db.view_count() - 1
+    feature_pre_pending = None
+    print(
+        f"Created reference view {view.view_id}: "
+        f"{len(keypoints)} SIFT keypoints detected."
+    )
+
+
+def select_nearest_feature(local_x, local_y, max_dist=12.0):
+    global feature_pre_pending
+    if feature_pre_db is None or not feature_pre_db.views:
+        print("Create a reference view with V before selecting features.")
+        return
+    view = feature_pre_db.views[feature_pre_active_index]
+    if len(view.keypoints) == 0:
+        print("Active reference view has no detected SIFT features.")
+        return
+    click = np.array([local_x, local_y], dtype=np.float32)
+    dists = np.linalg.norm(view.keypoints - click, axis=1)
+    keypoint_id = int(np.argmin(dists))
+    if float(dists[keypoint_id]) > max_dist:
+        print("No detected feature near the clicked location.")
+        return
+    if feature_pre_db.mapping_exists(view.view_id, keypoint_id):
+        print("That detected SIFT keypoint is already mapped in this reference view.")
+        return
+    feature_pre_pending = {
+        "view_id": view.view_id,
+        "keypoint_id": keypoint_id,
+    }
+    x, y = view.keypoints[keypoint_id]
+    print(f"Pending feature selected at exact keypoint ({x:.1f}, {y:.1f}).")
+
+
+def complete_pending_feature_mapping(world_point):
+    global feature_pre_pending
+    if feature_pre_pending is None:
+        print("Right click a detected SIFT feature before choosing the 3D match.")
+        return
+    mapping = feature_pre_db.add_mapping(
+        feature_pre_pending["view_id"],
+        feature_pre_pending["keypoint_id"],
+        world_point,
+    )
+    if mapping is None:
+        print("That detected SIFT keypoint is already mapped in this reference view.")
+    else:
+        feature_pre_session_added.append(mapping)
+        print(f"Mapped feature to 3D point {world_point}.")
+    feature_pre_pending = None
+
+
+def undo_feature_pre_mapping():
+    if not feature_pre_session_added:
+        print("Nothing to undo from this Pre session.")
+        return
+    mapping = feature_pre_session_added.pop()
+    if feature_pre_db.remove_mapping(mapping):
+        print("Undid the most recent mapping from this Pre session.")
+
+
+def save_feature_pre_active():
+    if feature_pre_demo:
+        print("Demo mode: changes are temporary and will not be saved.")
+        return
+    path = feature_pre_db.save_active(ACTIVE_MAP["name"])
+    print(
+        f"Saved active feature database to {path}: "
+        f"{feature_pre_db.view_count()} views, "
+        f"{feature_pre_db.mapped_feature_count()} mapped features."
+    )
+
+
+def save_feature_pre_snapshot():
+    if feature_pre_demo:
+        print("Demo mode: changes are temporary and will not be saved.")
+        return
+    path = feature_pre_db.save_snapshot(ACTIVE_MAP["name"])
+    print(f"Saved feature database snapshot to {path}.")
+
+
+def record_feature_run_attempt(view_w, view_h):
+    global feature_current_pair_index, feature_overlay_active
+    if active_feature_db is None:
+        reason = "no valid feature database loaded"
+        print(f"Feature Run: {reason}. Use: python world_split_v5.17.py --pre")
+        attempt = {
+            "true_pose": (c_x, c_y, c_z, r_x, r_y, r_z),
+            "estimated_pose": None,
+            "success": False,
+            "failure_reason": reason,
+            "query_keypoint_count": 0,
+            "good_descriptor_match_count": 0,
+            "pnp_inlier_count": None,
+            "reprojection_error": None,
+            "position_error": None,
+            "rotation_error": None,
+            "true_image": None,
+            "diff_image": None,
+        }
+        feature_run_attempts.append(attempt)
+        feature_current_pair_index = len(feature_run_attempts) - 1
+        feature_overlay_active = False
+        return
+
+    draw(recording_mode, trackers_mode, feature_mode)
+    query_bgr = read_viewport_bgr(0, 0, view_w, view_h, buffer=GL_FRONT,
+                                  lighting_profile=FEATURE_RUN_LIGHTING)
+    correspondences, _, metrics, match_failure = match_query_to_database(
+        active_feature_db, query_bgr)
+    print(
+        f"[features] {metrics['query_keypoint_count']} query keypoints, "
+        f"{metrics['good_descriptor_match_count']} good descriptor matches."
+    )
+    pnp = solve_pnp_feature(
+        correspondences, view_w, view_h,
+        actual_cam=(c_x, c_y, c_z, r_x, r_y, r_z),
+    )
+    if match_failure and not pnp["success"]:
+        pnp["failure_reason"] = match_failure
+    estimated_image = None
+    diff_image = None
+    if pnp["success"]:
+        estimated_image = render_view_matrix_to_bgr(view_w, view_h, pnp["view_matrix"])
+        diff_image = cv2.absdiff(query_bgr, estimated_image)
+        print(
+            "Feature Run success: "
+            f"inliers={pnp['pnp_inlier_count']} "
+            f"reproj={pnp['reprojection_error']:.2f}px "
+            f"pos_err={pnp['position_error']:.3f} "
+            f"rot_err={pnp['rotation_error']:.3f}"
+        )
+    else:
+        print(f"Feature Run failed: {pnp['failure_reason']}")
+
+    attempt = {
+        "true_pose": (c_x, c_y, c_z, r_x, r_y, r_z),
+        "estimated_pose": pnp["estimated_pose"],
+        "success": pnp["success"],
+        "failure_reason": pnp["failure_reason"],
+        "query_keypoint_count": metrics["query_keypoint_count"],
+        "good_descriptor_match_count": metrics["good_descriptor_match_count"],
+        "pnp_inlier_count": pnp["pnp_inlier_count"],
+        "reprojection_error": pnp["reprojection_error"],
+        "position_error": pnp["position_error"],
+        "rotation_error": pnp["rotation_error"],
+        "true_image": query_bgr,
+        "estimated_image": estimated_image,
+        "diff_image": diff_image,
+    }
+    feature_run_attempts.append(attempt)
+    feature_current_pair_index = len(feature_run_attempts) - 1
+    if pnp["success"]:
+        feature_est_view_mats[feature_current_pair_index] = pnp["view_matrix"]
+        feature_overlay_active = True
+    else:
+        feature_overlay_active = False
+
+
+def browse_feature_attempt(delta):
+    global feature_current_pair_index, feature_overlay_active
+    if not feature_run_attempts:
+        return
+    feature_current_pair_index = (
+        feature_current_pair_index + delta
+    ) % len(feature_run_attempts)
+    attempt = feature_run_attempts[feature_current_pair_index]
+    c_x, c_y, c_z, r_x, r_y, r_z = attempt["true_pose"]
+    globals()["c_x"], globals()["c_y"], globals()["c_z"] = c_x, c_y, c_z
+    globals()["r_x"], globals()["r_y"], globals()["r_z"] = r_x, r_y, r_z
+    feature_overlay_active = bool(attempt["success"])
+    status = "success" if attempt["success"] else f"failed: {attempt['failure_reason']}"
+    print(
+        f"Feature attempt {feature_current_pair_index + 1}/"
+        f"{len(feature_run_attempts)}: {status}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def main():
+def main(argv=None):
     global CONFIG, ACTIVE_MAP
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
@@ -1667,9 +1939,24 @@ def main():
     global tracker_overlay_active, tracker_current_pair_index
     global feature_mode, feature_cam_pairs, feature_est_view_mats
     global feature_overlay_active, feature_current_pair_index
+    global feature_run_attempts, feature_diff_mode, active_feature_db
+    global feature_pre_db, feature_pre_active_index, feature_pre_pending
+    global feature_pre_show_keypoints, feature_pre_session_added
+    global feature_pre_demo, feature_pre_save_confirm
     global running
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pre", action="store_true", help="launch Feature Pre Mode")
+    args = parser.parse_args(argv)
+
     CONFIG = read_config()
     ACTIVE_MAP = select_map_profile()
+
+    pre_action = None
+    if args.pre:
+        pre_action = select_feature_pre_action(ACTIVE_MAP["name"])
+        if pre_action == "cancel":
+            print("Feature Pre Mode cancelled.")
+            return
 
     color_summary = ACTIVE_MAP["color_path"] or "height-map colors"
     print(
@@ -1704,6 +1991,16 @@ def main():
     feature_est_view_mats       = {}    # pair_index -> 16-float column-major GL view matrix
     feature_overlay_active      = False # True when a pair is loaded onto left view
     feature_current_pair_index  = 0     # which pair is shown
+    feature_run_attempts        = []
+    feature_diff_mode           = False
+    active_feature_db           = None
+    feature_pre_db              = None
+    feature_pre_active_index    = 0
+    feature_pre_pending         = None
+    feature_pre_show_keypoints  = True
+    feature_pre_session_added   = []
+    feature_pre_demo            = (pre_action == "demo")
+    feature_pre_save_confirm    = False
     trackers_path = CONFIG.get("trackers_path", "trackers.txt")
     try:
         tracker_points = get_trackers_from_file(trackers_path)
@@ -1755,7 +2052,131 @@ def main():
     pyramid_vbo, pyramid_vertex_count = build_pyramid_vbo()
     print(f"Terrain VBO built: {terrain_vertex_count} vertices")
 
+    view_size = (display[0] // 2, display[1])
+    if args.pre:
+        loaded_db, db_path, db_errors = load_active_database(
+            ACTIVE_MAP, image.shape, view_size)
+        if pre_action == "continue":
+            if loaded_db is None or db_errors:
+                print("Feature database does not match selected map/settings.")
+                for error in db_errors:
+                    print(f"  {error}")
+                print("Starting with a new empty in-memory database.")
+                feature_pre_db = FeatureDatabase.empty(ACTIVE_MAP, image.shape, view_size)
+            else:
+                feature_pre_db = loaded_db
+                print(
+                    f"Continuing feature database: {feature_pre_db.view_count()} views, "
+                    f"{feature_pre_db.mapped_feature_count()} mapped features."
+                )
+        elif pre_action == "demo":
+            if loaded_db is not None and not db_errors:
+                feature_pre_db = loaded_db.clone()
+                print(
+                    f"Demo mode loaded active database copy: "
+                    f"{feature_pre_db.view_count()} views, "
+                    f"{feature_pre_db.mapped_feature_count()} mapped features."
+                )
+            else:
+                feature_pre_db = FeatureDatabase.empty(ACTIVE_MAP, image.shape, view_size)
+                print("Demo mode using a temporary empty database.")
+        else:
+            feature_pre_db = FeatureDatabase.empty(ACTIVE_MAP, image.shape, view_size)
+            print("Created a new empty in-memory feature database.")
+        if feature_pre_db.views:
+            feature_pre_active_index = 0
+            c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = feature_pre_db.views[0].pose
+    else:
+        loaded_db, db_path, db_errors = load_active_database(
+            ACTIVE_MAP, image.shape, view_size)
+        if loaded_db is not None and not db_errors:
+            active_feature_db = loaded_db
+            print(
+                f"Loaded feature database for {ACTIVE_MAP['name']}: "
+                f"{active_feature_db.view_count()} views, "
+                f"{active_feature_db.mapped_feature_count()} mapped features."
+            )
+        elif loaded_db is None:
+            print(f"No feature database found for {ACTIVE_MAP['name']}.")
+            print("Use: python world_split_v5.17.py --pre")
+        else:
+            print("Feature database does not match selected map/settings.")
+            for error in db_errors:
+                print(f"  {error}")
+            print("Run: python world_split_v5.17.py --pre")
+
     running = True
+    if args.pre:
+        while running:
+            update_window_caption("pre")
+            for event in pygame.event.get():
+                if event.type == QUIT:
+                    running = False
+                if event.type == VIDEORESIZE:
+                    resize(event.w, event.h)
+                if event.type == KEYDOWN:
+                    mods = pygame.key.get_mods()
+                    if feature_pre_save_confirm:
+                        if event.key == K_y:
+                            save_feature_pre_active()
+                            feature_pre_save_confirm = False
+                        elif event.key == K_n or event.key == K_ESCAPE:
+                            print("Save cancelled.")
+                            feature_pre_save_confirm = False
+                        continue
+                    if event.key == K_ESCAPE:
+                        running = False
+                    elif event.key == K_v:
+                        sw, sh = pygame.display.get_surface().get_size()
+                        create_feature_reference_view(sw // 2, sh)
+                    elif event.key == K_LEFTBRACKET and feature_pre_db.views:
+                        feature_pre_active_index = (
+                            feature_pre_active_index - 1
+                        ) % feature_pre_db.view_count()
+                        feature_pre_pending = None
+                    elif event.key == K_RIGHTBRACKET and feature_pre_db.views:
+                        feature_pre_active_index = (
+                            feature_pre_active_index + 1
+                        ) % feature_pre_db.view_count()
+                        feature_pre_pending = None
+                    elif event.key == K_h:
+                        feature_pre_show_keypoints = not feature_pre_show_keypoints
+                        print(
+                            "Detected keypoints visible: "
+                            f"{feature_pre_show_keypoints}"
+                        )
+                    elif event.key == K_u:
+                        undo_feature_pre_mapping()
+                    elif event.key == K_s and (mods & KMOD_CTRL):
+                        if mods & KMOD_SHIFT:
+                            save_feature_pre_snapshot()
+                        elif feature_pre_demo:
+                            print("Demo mode: changes are temporary and will not be saved.")
+                        else:
+                            feature_pre_save_confirm = True
+                            print("Save changes to active database? Y = save, N = cancel")
+                if event.type == MOUSEBUTTONDOWN:
+                    sw, sh = pygame.display.get_surface().get_size()
+                    half_w = sw // 2
+                    if event.button == 3 and event.pos[0] >= half_w:
+                        select_nearest_feature(event.pos[0] - half_w, event.pos[1])
+                    elif event.button == 1 and event.pos[0] < half_w:
+                        world_point = get_world_coords(event.pos[0], event.pos[1],
+                                                       view="left")
+                        if world_point is None:
+                            print("Left click missed terrain.")
+                        else:
+                            complete_pending_feature_mapping(world_point)
+            draw(recording_mode, feature_pre_mode=True)
+        glDeleteBuffers(1, [terrain_vbo])
+        glDeleteBuffers(1, [pyramid_vbo])
+        if _sphere_quadric is not None:
+            gluDeleteQuadric(_sphere_quadric)
+        pygame.quit()
+        if feature_pre_demo:
+            print("Demo mode: discarded temporary feature database changes.")
+        return
+
     while running:
         for event in pygame.event.get():
             if event.type == QUIT:
@@ -1849,92 +2270,8 @@ def main():
                             print(f"Tracker cam pair saved (total: {len(tracker_cam_pairs)})")
                             tracker_overlay_active = True
                     elif feature_mode:
-                        # --- Screenshot the left half (same capture as trackers) ---
                         sw, sh = pygame.display.get_surface().get_size()
-                        half_w = sw // 2
-                        glReadBuffer(GL_FRONT)
-                        pixels = glReadPixels(0, 0, half_w, sh,
-                                              GL_RGB, GL_UNSIGNED_BYTE)
-                        img_array = np.frombuffer(pixels, dtype=np.uint8)
-                        img_array = img_array.reshape((sh, half_w, 3))
-                        img_array = np.flipud(img_array)   # OpenGL is bottom-left
-                        img_bgr   = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                        #cv2.imwrite("screenshot_feature.png", img_bgr)
-                        #print("Feature screenshot saved to screenshot_feature.png")
-
-                        # Feature-matching pose estimation: match the query
-                        # screenshot against the SIFT/FLANN database learned at
-                        # startup, recover 2D-3D correspondences, run solve_pnp.
-                        # Returns None on failure -> placeholder fallback below.
-                        feat_result = estimate_pose_from_features(
-                            img_bgr, half_w, sh, actual_cam=(c_x, c_y, c_z, r_x, r_y, r_z))
-                        if feat_result is not None:
-                            est_cam_pos, est_euler, est_R, est_tvec = feat_result
-                            # solve_pnp returns cam_pos as the TRUE world
-                            # position, but actual_tuple/the error display use
-                            # the render convention (negated world position).
-                            # Negate so the stored estimate matches actual_tuple's
-                            # convention and the on-screen pos error agrees with
-                            # the console (which uses cam_pos + c).
-                            est_cam_pos = (-est_cam_pos[0], -est_cam_pos[1],
-                                           -est_cam_pos[2])
-                            # Pyramid uses render-convention angles; convert the
-                            # PnP rotation so the estimate isn't drawn flipped.
-                            if est_R is not None:
-                                est_euler = render_euler_from_pnp_R(est_R)
-                        else:
-                            # Fallback: identity estimate = actual left camera.
-                            # Convention (matches solve_pnp_trackers storage):
-                            #   position stored same-sign as actual  -> pos err 0
-                            #   euler stored negated                 -> rot err 0
-                            est_cam_pos = (c_x, c_y, c_z)
-                            est_euler   = (-r_x, -r_y, -r_z)
-                            est_R, est_tvec = None, None
-
-                        actual_tuple    = (c_x, c_y, c_z, r_x, r_y, r_z)
-                        estimated_tuple = (float(est_cam_pos[0]), float(est_cam_pos[1]),
-                                           float(est_cam_pos[2]), float(est_euler[0]),
-                                           float(est_euler[1]), float(est_euler[2]))
-                        feature_cam_pairs.append((actual_tuple, estimated_tuple))
-                        feature_current_pair_index = len(feature_cam_pairs) - 1
-
-                        if est_R is not None and est_tvec is not None:
-                            ext = np.eye(4, dtype=np.float64)
-                            ext[:3, :3] = est_R
-                            ext[:3, 3]  = np.asarray(est_tvec, dtype=np.float64).flatten()
-                            flip = np.diag([1.0, -1.0, -1.0, 1.0])
-                            m_gl = flip @ ext
-                            view_mat = m_gl.T.flatten().astype(np.float64).tolist()
-                        else:
-                            # Placeholder: reproduce the actual left-view matrix
-                            # so the overlay coincides exactly with the real view.
-                            # Built in numpy with the SAME (canonical-axis)
-                            # composition render_scene now uses, stored
-                            # column-major for glLoadMatrixd.
-                            def _rot(angle, ax, ay, az):
-                                a = math.radians(angle)
-                                c, s = math.cos(a), math.sin(a)
-                                n = math.sqrt(ax*ax + ay*ay + az*az)
-                                if n == 0:
-                                    return np.eye(4)
-                                ax, ay, az = ax/n, ay/n, az/n
-                                return np.array([
-                                    [ax*ax*(1-c)+c,    ax*ay*(1-c)-az*s, ax*az*(1-c)+ay*s, 0],
-                                    [ay*ax*(1-c)+az*s, ay*ay*(1-c)+c,    ay*az*(1-c)-ax*s, 0],
-                                    [az*ax*(1-c)-ay*s, az*ay*(1-c)+ax*s, az*az*(1-c)+c,    0],
-                                    [0, 0, 0, 1]], dtype=np.float64)
-                            def _trans(x, y, z):
-                                m = np.eye(4, dtype=np.float64)
-                                m[0, 3], m[1, 3], m[2, 3] = x, y, z
-                                return m
-                            M = (_rot(r_y, 0, 1, 0) @
-                                 _rot(r_x, 1, 0, 0) @
-                                 _rot(r_z, 0, 0, 1) @
-                                 _trans(c_x, c_y, c_z))
-                            view_mat = M.T.flatten().astype(np.float64).tolist()
-                        feature_est_view_mats[feature_current_pair_index] = view_mat
-                        print(f"Feature cam pair saved (total: {len(feature_cam_pairs)})")
-                        feature_overlay_active = True
+                        record_feature_run_attempt(sw // 2, sh)
                     else:
                         print(f"Saved ({c_x},{c_y},{c_z}) rot ({r_x},{r_y},{r_z})")
                         saved_positions.append((c_x, c_y, c_z, r_x, r_y, r_z))
@@ -1971,15 +2308,16 @@ def main():
                         tracker_overlay_active = False
                         pnp_result   = None
                         feature_overlay_active = False
-                        pygame.display.set_caption("World Split v3.5 - FEATURE MATCHING MODE")
                         # Snap right view to the first saved position (overview)
                         if saved_positions:
                             c_x2, c_y2, c_z2, r_x2, r_y2, r_z2 = saved_positions[0]
-                            print("Feature matching mode: right view snapped to starting position")
+                            print("Feature Run: right view snapped to starting position")
+                        if active_feature_db is None:
+                            print("Feature Run: no valid database loaded; B will record a failed attempt.")
                     else:
                         if not picking_mode:
                             recording_mode = True
-                    print(f"Feature matching mode: {'on' if feature_mode else 'off'}")
+                    print(f"Feature Run mode: {'on' if feature_mode else 'off'}")
                 if event.key == K_n and trackers_mode and tracker_cam_pairs:
                     tracker_current_pair_index = (tracker_current_pair_index - 1) % len(tracker_cam_pairs)
                     actual, _ = tracker_cam_pairs[tracker_current_pair_index]
@@ -1992,18 +2330,13 @@ def main():
                     c_x, c_y, c_z, r_x, r_y, r_z = actual
                     tracker_overlay_active = True
                     print(f"Tracker pair {tracker_current_pair_index + 1}/{len(tracker_cam_pairs)} : actual: {actual[:3]} estimated: {tracker_cam_pairs[tracker_current_pair_index][1][:3]}")
-                if event.key == K_n and feature_mode and feature_cam_pairs:
-                    feature_current_pair_index = (feature_current_pair_index - 1) % len(feature_cam_pairs)
-                    actual, _ = feature_cam_pairs[feature_current_pair_index]
-                    c_x, c_y, c_z, r_x, r_y, r_z = actual
-                    feature_overlay_active = True
-                    print(f"Feature pair {feature_current_pair_index + 1}/{len(feature_cam_pairs)} : actual: {actual[:3]} estimated: {feature_cam_pairs[feature_current_pair_index][1][:3]}")
-                if event.key == K_m and feature_mode and feature_cam_pairs:
-                    feature_current_pair_index = (feature_current_pair_index + 1) % len(feature_cam_pairs)
-                    actual, _ = feature_cam_pairs[feature_current_pair_index]
-                    c_x, c_y, c_z, r_x, r_y, r_z = actual
-                    feature_overlay_active = True
-                    print(f"Feature pair {feature_current_pair_index + 1}/{len(feature_cam_pairs)} : actual: {actual[:3]} estimated: {feature_cam_pairs[feature_current_pair_index][1][:3]}")
+                if event.key == K_n and feature_mode and feature_run_attempts:
+                    browse_feature_attempt(-1)
+                if event.key == K_m and feature_mode and feature_run_attempts:
+                    browse_feature_attempt(1)
+                if event.key == K_d and feature_mode:
+                    feature_diff_mode = not feature_diff_mode
+                    print("Feature comparison mode:", "diff" if feature_diff_mode else "overlay")
                 if event.key == K_r:
                     recording_index = 0
                     if saved_positions:
@@ -2086,18 +2419,7 @@ def main():
                         pending_left_world_point = None
                         pnp_result = None
                         print(f"Picked 3D {world_point} -> 2D {image_point}")
-        if trackers_mode:
-            pair_info = f" | Pair {tracker_current_pair_index+1}/{len(tracker_cam_pairs)}" if tracker_cam_pairs else ""
-            pygame.display.set_caption(f"Trackers mode | B - estimate | N/M - prev/next pair{pair_info} | P - picking | R - recording")
-        elif feature_mode:
-            pair_info = f" | Pair {feature_current_pair_index+1}/{len(feature_cam_pairs)}" if feature_cam_pairs else ""
-            pygame.display.set_caption(f"2D Feature matching mode | B - estimate | N/M - prev/next pair{pair_info} | P - picking | R - recording | T - trackers")
-        elif picking_mode:
-            pygame.display.set_caption("Picking mode | Click to pick points | C - solve PnP | R - toggle recording mode | T - toggle trackers mode")
-        elif recording_mode:
-            pygame.display.set_caption("Recording mode | Arrow keys to change index | R - toggle recording mode | T - toggle trackers mode | P - enter picking mode | B - record position")
-        else:
-            pygame.display.set_caption("Navigation mode | R - toggle recording mode | T - toggle trackers mode | P - enter picking mode")
+        update_window_caption("normal")
         draw(recording_mode, trackers_mode, feature_mode)
 
     glDeleteBuffers(1, [terrain_vbo])
