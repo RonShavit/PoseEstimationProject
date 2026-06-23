@@ -758,6 +758,7 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
 
 FEATURE_PRE_LIGHTING = "pre"
 FEATURE_RUN_LIGHTING = "run"
+FEATURE_PRE_MAX_CANDIDATES = 200
 
 
 def apply_feature_lighting_bgr(bgr, profile):
@@ -1227,6 +1228,62 @@ def draw_feature_pre_world_points():
     glMatrixMode(GL_MODELVIEW)
 
 
+def get_feature_pre_candidate_indices(view):
+    cached = feature_pre_candidate_cache.get(view.view_id)
+    if cached is not None:
+        return cached
+
+    count = len(view.keypoints)
+    if count <= FEATURE_PRE_MAX_CANDIDATES:
+        indices = np.arange(count, dtype=np.int32)
+        feature_pre_candidate_cache[view.view_id] = indices
+        return indices
+
+    points = np.asarray(view.keypoints, dtype=np.float32)
+    view_w, view_h = feature_pre_db.metadata.get("view_resolution", [640, 480])
+    view_w = max(float(view_w), 1.0)
+    view_h = max(float(view_h), 1.0)
+    cols = int(math.ceil(math.sqrt(FEATURE_PRE_MAX_CANDIDATES)))
+    rows = int(math.ceil(FEATURE_PRE_MAX_CANDIDATES / cols))
+    cell_best = {}
+
+    for keypoint_id, (x, y) in enumerate(points):
+        col = min(cols - 1, max(0, int((float(x) / view_w) * cols)))
+        row = min(rows - 1, max(0, int((float(y) / view_h) * rows)))
+        center_x = (col + 0.5) * view_w / cols
+        center_y = (row + 0.5) * view_h / rows
+        dist2 = (float(x) - center_x) ** 2 + (float(y) - center_y) ** 2
+        cell = (row, col)
+        current = cell_best.get(cell)
+        if current is None or dist2 < current[0] or (
+                dist2 == current[0] and keypoint_id < current[1]):
+            cell_best[cell] = (dist2, keypoint_id)
+
+    selected = []
+    selected_set = set()
+    for row in range(rows):
+        for col in range(cols):
+            current = cell_best.get((row, col))
+            if current is not None:
+                selected.append(current[1])
+                selected_set.add(current[1])
+                if len(selected) >= FEATURE_PRE_MAX_CANDIDATES:
+                    break
+        if len(selected) >= FEATURE_PRE_MAX_CANDIDATES:
+            break
+
+    if len(selected) < FEATURE_PRE_MAX_CANDIDATES:
+        for keypoint_id in range(count):
+            if keypoint_id not in selected_set:
+                selected.append(keypoint_id)
+                if len(selected) >= FEATURE_PRE_MAX_CANDIDATES:
+                    break
+
+    indices = np.asarray(selected, dtype=np.int32)
+    feature_pre_candidate_cache[view.view_id] = indices
+    return indices
+
+
 def draw_feature_pre_keypoints_2d():
     if feature_pre_db is None or not feature_pre_db.views:
         return
@@ -1246,9 +1303,13 @@ def draw_feature_pre_keypoints_2d():
     glLineWidth(2.0)
     if feature_pre_show_keypoints:
         glColor3f(0.0, 0.55, 0.75)
-        for x, y in view.keypoints:
-            draw_2d_pick_dot((half_w + float(x), float(y)),
-                             color=(0.0, 0.55, 0.75), radius=2.5)
+        glPointSize(4.0)
+        glBegin(GL_POINTS)
+        for keypoint_id in get_feature_pre_candidate_indices(view):
+            x, y = view.keypoints[int(keypoint_id)]
+            glVertex2f(half_w + float(x), float(y))
+        glEnd()
+        glPointSize(1.0)
     for keypoint_id in mapped_ids:
         if keypoint_id < len(view.keypoints):
             draw_2d_pick_marker((half_w + float(view.keypoints[keypoint_id][0]),
@@ -1373,7 +1434,7 @@ def draw_tracker_cam_pairs(pairs):
 # Scene rendering
 # ---------------------------------------------------------------------------
 def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
-                 feature_mode=False, feature_pre_mode=False):
+                 feature_mode=False, feature_pre_mode=False, motion_scale=1.0):
     global CONFIG, ACTIVE_MAP
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
@@ -1384,8 +1445,8 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
     global feature_cam_pairs, feature_overlay_active, feature_current_pair_index
     global feature_run_attempts
 
-    r_speed   = 0.1
-    rot_speed = 0.5
+    r_speed   = 0.1 * motion_scale
+    rot_speed = 0.5 * motion_scale
 
     dx =  math.sin(r_y * math.pi / 180)
     dz = -math.cos(r_y * math.pi / 180)
@@ -1495,7 +1556,7 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
 # Main draw (split-screen)
 # ---------------------------------------------------------------------------
 def draw(recording_mode, trackers_mode=False, feature_mode=False,
-         feature_pre_mode=False):
+         feature_pre_mode=False, motion_scale=1.0):
     global picking_mode, pnp_result, picked_correspondences
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
@@ -1521,7 +1582,8 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False,
     draw_gradient_background()
     render_scene(apply_input=True, recording_mode=recording_mode,
                  trackers_mode=trackers_mode, feature_mode=feature_mode,
-                 feature_pre_mode=feature_pre_mode)
+                 feature_pre_mode=feature_pre_mode,
+                 motion_scale=motion_scale)
     if feature_mode:
         draw_feature_lighting_overlay(FEATURE_RUN_LIGHTING, 0, 0, width // 2, height)
     if picking_mode:
@@ -1836,10 +1898,16 @@ def select_nearest_feature(local_x, local_y, max_dist=12.0):
     if len(view.keypoints) == 0:
         print("Active reference view has no detected SIFT features.")
         return
+    candidate_indices = get_feature_pre_candidate_indices(view)
+    if len(candidate_indices) == 0:
+        print("Active reference view has no visible SIFT candidates.")
+        return
     click = np.array([local_x, local_y], dtype=np.float32)
-    dists = np.linalg.norm(view.keypoints - click, axis=1)
-    keypoint_id = int(np.argmin(dists))
-    if float(dists[keypoint_id]) > max_dist:
+    candidate_points = view.keypoints[candidate_indices]
+    dists = np.linalg.norm(candidate_points - click, axis=1)
+    candidate_pos = int(np.argmin(dists))
+    keypoint_id = int(candidate_indices[candidate_pos])
+    if float(dists[candidate_pos]) > max_dist:
         print("No detected feature near the clicked location.")
         return
     if feature_pre_db.mapping_exists(view.view_id, keypoint_id):
@@ -2019,6 +2087,7 @@ def main(argv=None):
     global feature_pre_db, feature_pre_active_index, feature_pre_pending
     global feature_pre_show_keypoints, feature_pre_session_added
     global feature_pre_demo, feature_pre_save_confirm
+    global feature_pre_candidate_cache
     global running
     parser = argparse.ArgumentParser()
     parser.add_argument("--pre", action="store_true", help="launch Feature Pre Mode")
@@ -2077,6 +2146,7 @@ def main(argv=None):
     feature_pre_session_added   = []
     feature_pre_demo            = (pre_action == "demo")
     feature_pre_save_confirm    = False
+    feature_pre_candidate_cache = {}
     trackers_path = CONFIG.get("trackers_path", "trackers.txt")
     try:
         tracker_points = get_trackers_from_file(trackers_path)
@@ -2107,6 +2177,7 @@ def main(argv=None):
     pygame.display.set_icon(icon)
     resize(*display)
     init()
+    clock = pygame.time.Clock()
 
     color_map_path = ACTIVE_MAP["color_path"]
     col = cv2.imread(color_map_path) if color_map_path else None
@@ -2184,6 +2255,8 @@ def main(argv=None):
     running = True
     if args.pre:
         while running:
+            dt = min(clock.tick(60) / 1000.0, 0.10)
+            motion_scale = dt * 60.0
             update_window_caption("pre")
             for event in pygame.event.get():
                 if event.type == QUIT:
@@ -2243,7 +2316,8 @@ def main(argv=None):
                             print("Left click missed terrain.")
                         else:
                             complete_pending_feature_mapping(world_point)
-            draw(recording_mode, feature_pre_mode=True)
+            draw(recording_mode, feature_pre_mode=True,
+                 motion_scale=motion_scale)
         glDeleteBuffers(1, [terrain_vbo])
         glDeleteBuffers(1, [pyramid_vbo])
         if _sphere_quadric is not None:
@@ -2254,6 +2328,8 @@ def main(argv=None):
         return
 
     while running:
+        dt = min(clock.tick(60) / 1000.0, 0.10)
+        motion_scale = dt * 60.0
         for event in pygame.event.get():
             if event.type == QUIT:
                 running = False
@@ -2496,7 +2572,8 @@ def main(argv=None):
                         pnp_result = None
                         print(f"Picked 3D {world_point} -> 2D {image_point}")
         update_window_caption("normal")
-        draw(recording_mode, trackers_mode, feature_mode)
+        draw(recording_mode, trackers_mode, feature_mode,
+             motion_scale=motion_scale)
 
     glDeleteBuffers(1, [terrain_vbo])
     glDeleteBuffers(1, [pyramid_vbo])
