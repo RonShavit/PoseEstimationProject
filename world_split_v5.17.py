@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import ctypes
 import argparse
+import time
 from read_config import read_config
 from trackers import get_trackers_from_file
 from color_picking import find_blob_centers
@@ -759,6 +760,9 @@ def solve_pnp_trackers(tracker_2d_3d_pairs, view_w, view_h):
 FEATURE_PRE_LIGHTING = "pre"
 FEATURE_RUN_LIGHTING = "run"
 FEATURE_PRE_MAX_CANDIDATES = 200
+FEATURE_RUN_MIN_RANSAC_INLIERS = 6
+FEATURE_RUN_MIN_RANSAC_INLIER_RATIO = 0.60
+FEATURE_RUN_MAX_INLIER_REPROJECTION_ERROR = 4.0
 
 
 def apply_feature_lighting_bgr(bgr, profile):
@@ -937,21 +941,57 @@ def solve_pnp_feature(correspondences, view_w, view_h, actual_cam):
         inliers = None
         result["failure_reason"] = exc.msg.splitlines()[0]
     if not ok:
-        rvec, tvec = _try_solvers(
-            pts3d, pts2d, K, dist,
-            [(cv2.SOLVEPNP_EPNP, "EPNP"), (cv2.SOLVEPNP_IPPE, "IPPE")])
-    if rvec is None:
-        result["failure_reason"] = result["failure_reason"] or "solvePnP failed"
+        result["failure_reason"] = (
+            result["failure_reason"] or
+            "Feature Run rejected: RANSAC failed to produce a pose."
+        )
+        return result
+    if inliers is None or len(inliers) == 0:
+        result["failure_reason"] = "Feature Run rejected: RANSAC found no inliers."
         return result
 
+    inlier_indices = np.asarray(inliers, dtype=np.int32).reshape(-1)
+    inlier_count = int(len(inlier_indices))
+    valid_count = int(len(valid_correspondences))
+    inlier_ratio = inlier_count / float(valid_count)
+
     try:
-        cv2.solvePnPRefineLM(pts3d, pts2d, K, dist, rvec, tvec)
+        cv2.solvePnPRefineLM(pts3d[inlier_indices], pts2d[inlier_indices],
+                             K, dist, rvec, tvec)
     except cv2.error:
         pass
 
     R, _ = cv2.Rodrigues(rvec)
-    proj, _ = cv2.projectPoints(pts3d, rvec, tvec, K, dist)
-    reproj_err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1)))
+    proj, _ = cv2.projectPoints(pts3d[inlier_indices], rvec, tvec, K, dist)
+    reproj_err = float(np.mean(np.linalg.norm(
+        proj.reshape(-1, 2) - pts2d[inlier_indices], axis=1)))
+
+    if inlier_count < FEATURE_RUN_MIN_RANSAC_INLIERS:
+        result["failure_reason"] = (
+            f"Feature Run rejected: RANSAC found {inlier_count} inliers, "
+            f"but at least {FEATURE_RUN_MIN_RANSAC_INLIERS} are required."
+        )
+        result["pnp_inlier_count"] = inlier_count
+        result["reprojection_error"] = reproj_err
+        return result
+    if inlier_ratio < FEATURE_RUN_MIN_RANSAC_INLIER_RATIO:
+        result["failure_reason"] = (
+            f"Feature Run rejected: RANSAC inlier ratio {inlier_ratio:.2f} "
+            f"is below required {FEATURE_RUN_MIN_RANSAC_INLIER_RATIO:.2f}."
+        )
+        result["pnp_inlier_count"] = inlier_count
+        result["reprojection_error"] = reproj_err
+        return result
+    if reproj_err > FEATURE_RUN_MAX_INLIER_REPROJECTION_ERROR:
+        result["failure_reason"] = (
+            f"Feature Run rejected: mean inlier reprojection error "
+            f"{reproj_err:.2f}px exceeds "
+            f"{FEATURE_RUN_MAX_INLIER_REPROJECTION_ERROR:.2f}px."
+        )
+        result["pnp_inlier_count"] = inlier_count
+        result["reprojection_error"] = reproj_err
+        return result
+
     cam_pos = (-R.T @ tvec).flatten()
     estimated_pose = (
         float(-cam_pos[0]), float(-cam_pos[1]), float(-cam_pos[2]),
@@ -970,7 +1010,8 @@ def solve_pnp_feature(correspondences, view_w, view_h, actual_cam):
         "R": R,
         "tvec": tvec,
         "view_matrix": view_mat,
-        "pnp_inlier_count": int(len(inliers)) if inliers is not None else None,
+        "pnp_inlier_count": inlier_count,
+        "pnp_inlier_ratio": inlier_ratio,
         "reprojection_error": reproj_err,
         "position_error": float(pos_err),
         "rotation_error": float(rot_err),
@@ -1455,14 +1496,16 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
 
     if apply_input and (not picking_mode or trackers_mode or feature_mode or feature_pre_mode):
         keys_pressed = pygame.key.get_pressed()
+        mods = pygame.key.get_mods()
+        allow_movement = not (mods & (KMOD_CTRL | KMOD_ALT))
         if recording_mode or trackers_mode or feature_mode or feature_pre_mode:
             moved = False
             yaw_delta = 0.0
-            if keys_pressed[K_LEFT]:   yaw_delta -= rot_speed;  moved = True
-            if keys_pressed[K_RIGHT]:  yaw_delta += rot_speed;  moved = True
+            if allow_movement and keys_pressed[K_LEFT]:   yaw_delta -= rot_speed;  moved = True
+            if allow_movement and keys_pressed[K_RIGHT]:  yaw_delta += rot_speed;  moved = True
             tilt = 0.0
-            if keys_pressed[K_DOWN]:   tilt += rot_speed;  moved = True
-            if keys_pressed[K_UP]:     tilt -= rot_speed;  moved = True
+            if allow_movement and keys_pressed[K_DOWN]:   tilt += rot_speed;  moved = True
+            if allow_movement and keys_pressed[K_UP]:     tilt -= rot_speed;  moved = True
 
             if yaw_delta:
                 # Preserve the current vertical tilt magnitude/direction while
@@ -1479,12 +1522,12 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 yaw_rad = r_y * math.pi / 180
                 r_x += tilt * math.cos(yaw_rad)
                 r_z += tilt * math.sin(yaw_rad)
-            if keys_pressed[K_a]:      c_x += rx * r_speed;  c_z += rz * r_speed;  moved = True
-            if keys_pressed[K_d]:      c_x -= rx * r_speed;  c_z -= rz * r_speed;  moved = True
-            if keys_pressed[K_w]:      c_x -= dx * r_speed;  c_z -= dz * r_speed;  moved = True
-            if keys_pressed[K_s]:      c_x += dx * r_speed;  c_z += dz * r_speed;  moved = True
-            if keys_pressed[K_SPACE]:  c_y -= r_speed;  moved = True
-            if keys_pressed[K_LSHIFT]: c_y += r_speed;  moved = True
+            if allow_movement and keys_pressed[K_a]:      c_x += rx * r_speed;  c_z += rz * r_speed;  moved = True
+            if allow_movement and keys_pressed[K_d]:      c_x -= rx * r_speed;  c_z -= rz * r_speed;  moved = True
+            if allow_movement and keys_pressed[K_w]:      c_x -= dx * r_speed;  c_z -= dz * r_speed;  moved = True
+            if allow_movement and keys_pressed[K_s]:      c_x += dx * r_speed;  c_z += dz * r_speed;  moved = True
+            if allow_movement and keys_pressed[K_SPACE]:  c_y -= r_speed;  moved = True
+            if allow_movement and keys_pressed[K_LSHIFT]: c_y += r_speed;  moved = True
             if moved and trackers_mode:
                 tracker_overlay_active = False
             if moved and feature_mode:
@@ -1810,7 +1853,7 @@ def update_window_caption(mode):
                 "Feature Pre [EDIT] | WASD/Arrows - move 3D view | V - new view | "
                 "[/] - browse views | H - keypoints | Right click - feature | "
                 "Left click - 3D match | U - undo | Ctrl+S - save | "
-                "Ctrl+Shift+S - snapshot | Esc - exit"
+                "Ctrl+P - snapshot | Esc - exit"
             )
     elif feature_mode:
         attempt_info = (
@@ -1819,7 +1862,7 @@ def update_window_caption(mode):
         )
         caption = (
             "Feature Run | WASD/Arrows - move | B - estimate pose | "
-            "N/M - browse attempts | D - overlay/diff | F - exit feature run"
+            "N/M - browse attempts | O - overlay/diff | F - exit feature run"
             f"{attempt_info}"
         )
     elif trackers_mode:
@@ -1970,11 +2013,12 @@ def save_feature_pre_snapshot():
 
 def record_feature_run_attempt(view_w, view_h):
     global feature_current_pair_index, feature_overlay_active
+    actual_pose = (c_x, c_y, c_z, r_x, r_y, r_z)
     if active_feature_db is None:
         reason = "no valid feature database loaded"
         print(f"Feature Run: {reason}. Use: python world_split_v5.17.py --pre")
         attempt = {
-            "true_pose": (c_x, c_y, c_z, r_x, r_y, r_z),
+            "true_pose": actual_pose,
             "estimated_pose": None,
             "success": False,
             "failure_reason": reason,
@@ -1992,9 +2036,8 @@ def record_feature_run_attempt(view_w, view_h):
         feature_overlay_active = False
         return
 
-    draw(recording_mode, trackers_mode, feature_mode)
-    query_bgr = read_viewport_bgr(0, 0, view_w, view_h, buffer=GL_FRONT,
-                                  lighting_profile=FEATURE_RUN_LIGHTING)
+    query_bgr = render_pose_to_bgr(
+        view_w, view_h, actual_pose, FEATURE_RUN_LIGHTING)
     correspondences, _, metrics, match_failure = match_query_to_database(
         active_feature_db, query_bgr)
     print(
@@ -2003,7 +2046,7 @@ def record_feature_run_attempt(view_w, view_h):
     )
     pnp = solve_pnp_feature(
         correspondences, view_w, view_h,
-        actual_cam=(c_x, c_y, c_z, r_x, r_y, r_z),
+        actual_cam=actual_pose,
     )
     if match_failure and not pnp["success"]:
         pnp["failure_reason"] = match_failure
@@ -2023,7 +2066,7 @@ def record_feature_run_attempt(view_w, view_h):
         print(f"Feature Run failed: {pnp['failure_reason']}")
 
     attempt = {
-        "true_pose": (c_x, c_y, c_z, r_x, r_y, r_z),
+        "true_pose": actual_pose,
         "estimated_pose": pnp["estimated_pose"],
         "success": pnp["success"],
         "failure_reason": pnp["failure_reason"],
@@ -2177,7 +2220,6 @@ def main(argv=None):
     pygame.display.set_icon(icon)
     resize(*display)
     init()
-    clock = pygame.time.Clock()
 
     color_map_path = ACTIVE_MAP["color_path"]
     col = cv2.imread(color_map_path) if color_map_path else None
@@ -2254,8 +2296,11 @@ def main(argv=None):
 
     running = True
     if args.pre:
+        feature_pre_last_time = time.perf_counter()
         while running:
-            dt = min(clock.tick(60) / 1000.0, 0.10)
+            now = time.perf_counter()
+            dt = min(now - feature_pre_last_time, 0.10)
+            feature_pre_last_time = now
             motion_scale = dt * 60.0
             update_window_caption("pre")
             for event in pygame.event.get():
@@ -2297,13 +2342,13 @@ def main(argv=None):
                     elif event.key == K_u:
                         undo_feature_pre_mapping()
                     elif event.key == K_s and (mods & KMOD_CTRL):
-                        if mods & KMOD_SHIFT:
-                            save_feature_pre_snapshot()
-                        elif feature_pre_demo:
+                        if feature_pre_demo:
                             print("Demo mode: changes are temporary and will not be saved.")
                         else:
                             feature_pre_save_confirm = True
                             print("Save changes to active database? Y = save, N = cancel")
+                    elif event.key == K_p and (mods & KMOD_CTRL):
+                        save_feature_pre_snapshot()
                 if event.type == MOUSEBUTTONDOWN:
                     sw, sh = pygame.display.get_surface().get_size()
                     half_w = sw // 2
@@ -2328,8 +2373,6 @@ def main(argv=None):
         return
 
     while running:
-        dt = min(clock.tick(60) / 1000.0, 0.10)
-        motion_scale = dt * 60.0
         for event in pygame.event.get():
             if event.type == QUIT:
                 running = False
@@ -2486,7 +2529,7 @@ def main(argv=None):
                     browse_feature_attempt(-1)
                 if event.key == K_m and feature_mode and feature_run_attempts:
                     browse_feature_attempt(1)
-                if event.key == K_d and feature_mode:
+                if event.key == K_o and feature_mode:
                     feature_diff_mode = not feature_diff_mode
                     print("Feature comparison mode:", "diff" if feature_diff_mode else "overlay")
                 if event.key == K_r:
@@ -2572,8 +2615,7 @@ def main(argv=None):
                         pnp_result = None
                         print(f"Picked 3D {world_point} -> 2D {image_point}")
         update_window_caption("normal")
-        draw(recording_mode, trackers_mode, feature_mode,
-             motion_scale=motion_scale)
+        draw(recording_mode, trackers_mode, feature_mode)
 
     glDeleteBuffers(1, [terrain_vbo])
     glDeleteBuffers(1, [pyramid_vbo])
