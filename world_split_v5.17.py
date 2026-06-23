@@ -763,6 +763,7 @@ FEATURE_PRE_MAX_CANDIDATES = 200
 FEATURE_RUN_MIN_RANSAC_INLIERS = 6
 FEATURE_RUN_MIN_RANSAC_INLIER_RATIO = 0.60
 FEATURE_RUN_MAX_INLIER_REPROJECTION_ERROR = 4.0
+FEATURE_PRE_RESET_DT_SECONDS = 1.5
 
 
 def apply_feature_lighting_bgr(bgr, profile):
@@ -1415,6 +1416,30 @@ def draw_feature_run_attempts(attempts):
                         color=(1.0, 1.0, 0.0), radius=2.2)
 
 
+def draw_feature_run_overview_annotations(width, height):
+    if not feature_run_attempts:
+        return
+    glViewport(width // 2, 0, width // 2, height)
+    glMatrixMode(GL_PROJECTION); glLoadIdentity()
+    gluPerspective(45, (width / 2) / height, NEAR, FAR)
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity()
+    glRotatef(r_y2, 0, 1, 0)
+    glRotatef(r_x2, 1, 0, 0)
+    glRotatef(r_z2, 0, 0, 1)
+    glTranslatef(c_x2, c_y2, c_z2)
+
+    depth_was_enabled = bool(glIsEnabled(GL_DEPTH_TEST))
+    old_depth_mask = bool(np.asarray(glGetBooleanv(GL_DEPTH_WRITEMASK)).item())
+    glDisable(GL_DEPTH_TEST)
+    glDepthMask(GL_FALSE)
+    draw_feature_run_attempts(feature_run_attempts)
+    glDepthMask(GL_TRUE if old_depth_mask else GL_FALSE)
+    if depth_was_enabled:
+        glEnable(GL_DEPTH_TEST)
+    else:
+        glDisable(GL_DEPTH_TEST)
+
+
 def draw_tracker_sphere(x, y, z, r=0.0, g=1.0, b=0.2):
     """Draw a sphere at (x,y,z) with the given RGB colour and TRACKER_RADIUS."""
     glPushMatrix()
@@ -1557,14 +1582,6 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
                 draw_tracker_cam_pairs([pos])
                 glPopMatrix()
-        elif feature_mode and feature_run_attempts:
-            # In feature mode the right view shows true, estimated, and failure path markers.
-            glPushMatrix()
-            glLoadIdentity()
-            glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
-            glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
-            draw_feature_run_attempts(feature_run_attempts)
-            glPopMatrix()
         elif not trackers_mode and not feature_mode:
             for pos in saved_positions:
                 px, py, pz, prx, pry, prz = pos
@@ -1738,6 +1755,7 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False,
     if feature_mode:
         draw_feature_lighting_overlay(FEATURE_RUN_LIGHTING,
                                       width // 2, 0, width // 2, height)
+        draw_feature_run_overview_annotations(width, height)
     c_x, c_y, c_z, r_x, r_y, r_z = old_cam
     if feature_pre_mode:
         draw_feature_pre_keypoints_2d()
@@ -2299,13 +2317,18 @@ def main(argv=None):
         feature_pre_last_time = time.perf_counter()
         while running:
             now = time.perf_counter()
-            dt = min(now - feature_pre_last_time, 0.10)
+            dt = now - feature_pre_last_time
             feature_pre_last_time = now
+            if dt > FEATURE_PRE_RESET_DT_SECONDS:
+                dt = 0.0
             motion_scale = dt * 60.0
             update_window_caption("pre")
             for event in pygame.event.get():
                 if event.type == QUIT:
                     running = False
+                if (hasattr(pygame, "WINDOWFOCUSGAINED") and
+                        event.type == pygame.WINDOWFOCUSGAINED):
+                    feature_pre_last_time = time.perf_counter()
                 if event.type == VIDEORESIZE:
                     resize(event.w, event.h)
                 if event.type == KEYDOWN:
