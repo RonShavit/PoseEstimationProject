@@ -1561,8 +1561,8 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 img = cv2.imread(ACTIVE_MAP["height_path"])
                 ih, iw, _ = img.shape
                 m = ACTIVE_MAP["margin"]
-                c_x, c_y, c_z = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
-                r_x, r_y, r_z = CONFIG.get("start_a"), 0.0, 0.0
+                c_x, c_y, c_z = -iw/m/2, float(CONFIG.get("start_h")), -(ih/m)-100
+                r_x, r_y, r_z = float(CONFIG.get("start_a")), 0.0, 0.0
                 tracker_overlay_active = False
                 feature_overlay_active = False
         else:
@@ -1579,6 +1579,7 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 glPushMatrix()
                 glLoadIdentity()
                 glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
+                print(f"AAAAAAAAAAAAAA {type(c_y2)}")
                 glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
                 draw_tracker_cam_pairs([pos])
                 glPopMatrix()
@@ -1645,7 +1646,7 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False,
                  feature_pre_mode=feature_pre_mode,
                  motion_scale=motion_scale)
     if feature_mode:
-        draw_feature_lighting_overlay(FEATURE_RUN_LIGHTING, 0, 0, width // 2, height)
+        draw_feature_lighting_overlay(FEATURE_PRE_LIGHTING, 0, 0, width // 2, height)
     if picking_mode:
         draw_left_world_pick_markers(picked_points, pending_left_world_point)
     if feature_pre_mode:
