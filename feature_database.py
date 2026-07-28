@@ -122,6 +122,26 @@ class FeatureDatabase:
         pts = np.asarray([m["world_point"] for m in self.mappings], dtype=np.float32)
         return desc, pts
 
+    def descriptors_3d_with_ids(self):
+        """
+        Same as descriptors_3d(), plus a parallel array of point_id strings so
+        callers can tell which descriptor rows are variants of the same
+        underlying 3D landmark (e.g. from ASIFT augmentation).
+        """
+        if not self.mappings:
+            return (
+                np.empty((0, 128), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0,), dtype="U16"),
+            )
+        desc = np.asarray([m["descriptor"] for m in self.mappings], dtype=np.float32)
+        pts = np.asarray([m["world_point"] for m in self.mappings], dtype=np.float32)
+        point_ids = np.asarray(
+            [m.get("point_id") or f"legacy_{i}" for i, m in enumerate(self.mappings)],
+            dtype="U16",
+        )
+        return desc, pts, point_ids
+
     def add_reference_view(self, pose, keypoints, descriptors):
         if descriptors is None:
             descriptors = np.empty((0, 128), dtype=np.float32)
@@ -155,6 +175,7 @@ class FeatureDatabase:
         if self.mapping_exists(view_id, keypoint_id):
             return None
         mapping = {
+            "point_id": uuid4().hex[:16],
             "view_id": view_id,
             "keypoint_id": keypoint_id,
             "keypoint": tuple(float(v) for v in view.keypoints[keypoint_id]),
@@ -166,9 +187,49 @@ class FeatureDatabase:
         self.touch()
         return mapping
 
+    def add_mapping_variant(self, point_id, view_id, keypoint, descriptor, world_point):
+        """
+        Add an extra descriptor entry for an *already-mapped* 3D point, e.g. from
+        an ASIFT-simulated viewpoint of an existing reference view. Shares
+        point_id/world_point with the original mapping so matching code can
+        group variants of the same landmark together, but keypoint_id is a
+        sentinel (-1) since it doesn't correspond to a real detected keypoint
+        row in any ReferenceView.
+        """
+        mapping = {
+            "point_id": point_id,
+            "view_id": view_id,
+            "keypoint_id": -1,
+            "keypoint": tuple(float(v) for v in keypoint),
+            "descriptor": np.asarray(descriptor, dtype=np.float32).reshape(128),
+            "world_point": tuple(float(v) for v in world_point),
+            "created_at": utc_timestamp(),
+        }
+        self.mappings.append(mapping)
+        self.touch()
+        return mapping
+
+    def variant_count(self):
+        return sum(1 for m in self.mappings if int(m.get("keypoint_id", 0)) == -1)
+
+    def distinct_point_count(self):
+        return len({m["point_id"] for m in self.mappings})
+
+    def mappings_for_view(self, view_id):
+        return [m for m in self.mappings if m["view_id"] == view_id]
+
     def remove_mapping(self, mapping):
+        target_point_id = mapping.get("point_id")
         for index in range(len(self.mappings) - 1, -1, -1):
             item = self.mappings[index]
+            if target_point_id is not None and item.get("point_id") is not None:
+                if (item["point_id"] == target_point_id
+                        and item["view_id"] == mapping["view_id"]
+                        and int(item["keypoint_id"]) == int(mapping["keypoint_id"])):
+                    del self.mappings[index]
+                    self.touch()
+                    return True
+                continue
             if (item["view_id"] == mapping["view_id"]
                     and int(item["keypoint_id"]) == int(mapping["keypoint_id"])
                     and tuple(item["world_point"]) == tuple(mapping["world_point"])):
@@ -222,6 +283,10 @@ class FeatureDatabase:
         mapping_world = np.asarray([m["world_point"] for m in self.mappings],
                                    dtype=np.float32).reshape((-1, 3))
         mapping_created_at = np.asarray([m["created_at"] for m in self.mappings], dtype="U32")
+        mapping_point_ids = np.asarray(
+            [m.get("point_id") or f"legacy_{i}" for i, m in enumerate(self.mappings)],
+            dtype="U16",
+        )
         return {
             "metadata_json": np.asarray(json.dumps(self.metadata, sort_keys=True)),
             "view_ids": view_ids,
@@ -236,6 +301,7 @@ class FeatureDatabase:
             "mapping_descriptors": mapping_descriptors,
             "mapping_world_points": mapping_world,
             "mapping_created_at": mapping_created_at,
+            "mapping_point_ids": mapping_point_ids,
         }
 
     @classmethod
@@ -258,9 +324,16 @@ class FeatureDatabase:
                     descriptors=np.asarray(descriptors[start:start + count], dtype=np.float32),
                     created_at=str(view_created_at[i]),
                 ))
+            # "mapping_point_ids" was added after schema_version 1; older databases
+            # won't have it, so fall back to one independent point_id per mapping
+            # (which is correct for legacy data anyway, since it predates variants).
+            has_point_ids = "mapping_point_ids" in data.files
+            mapping_point_ids = data["mapping_point_ids"] if has_point_ids else None
             mappings = []
             for i, view_id in enumerate(data["mapping_view_ids"]):
                 mappings.append({
+                    "point_id": (str(mapping_point_ids[i]) if has_point_ids
+                                 else f"legacy_{i}"),
                     "view_id": str(view_id),
                     "keypoint_id": int(data["mapping_keypoint_ids"][i]),
                     "keypoint": tuple(float(v) for v in data["mapping_keypoints"][i]),

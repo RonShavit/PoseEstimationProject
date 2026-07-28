@@ -8,7 +8,7 @@ def make_sift():
             "cv2.SIFT_create not available - install opencv-contrib-python "
             "or a recent opencv-python build with SIFT support."
         )
-    return cv2.SIFT_create()
+    return cv2.SIFT_create(contrastThreshold=0.02, edgeThreshold=15)
 
 
 def make_flann():
@@ -38,7 +38,7 @@ def build_matcher(database):
     return matcher, descriptors, points3d
 
 
-def match_query_to_database(database, query_bgr, ratio=0.7):
+def match_query_to_database(database, query_bgr, ratio=0.78):
     query_keypoints, query_descriptors = detect_sift_features(query_bgr)
     matcher, mapped_descriptors, mapped_points = build_matcher(database)
     metrics = {
