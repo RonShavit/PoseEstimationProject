@@ -54,7 +54,13 @@ MAP_PROFILES = {
         "map_scale": 150.0,
         "blur_sigma": 2.0,
     },
-
+        "map_5":{
+        "height_path": os.path.join("maps", "map_5.png"),
+        "color_path": os.path.join("colors", "col_5.png"),
+        "margin": 1,
+        "map_scale": 20.0,
+        "blur_sigma": 0.0,
+    }
 }
 
 DEFAULT_MAP_PROFILE = {
@@ -1257,9 +1263,18 @@ def draw_right_image_points_2d(correspondences):
 
 
 def draw_feature_pre_world_points():
-    if feature_pre_db is None:
+    if feature_pre_db is None or not feature_pre_db.views:
         return
-    points = [mapping["world_point"] for mapping in feature_pre_db.mappings]
+    active_view = feature_pre_db.views[feature_pre_active_index]
+    seen_point_ids = set()
+    points = []
+    for mapping in feature_pre_db.mappings_for_view(active_view.view_id):
+        point_id = mapping.get("point_id")
+        if point_id is not None and point_id in seen_point_ids:
+            continue  # an ASIFT variant of a point already counted for this view
+        if point_id is not None:
+            seen_point_ids.add(point_id)
+        points.append(mapping["world_point"])
     if not points:
         return
     width, height = pygame.display.get_surface().get_size()
@@ -1595,7 +1610,6 @@ def render_scene(apply_input=True, recording_mode=True, trackers_mode=False,
                 glPushMatrix()
                 glLoadIdentity()
                 glRotatef(r_y2, 0, 1, 0); glRotatef(r_x2, 1, 0, 0)
-                print(f"AAAAAAAAAAAAAA {type(c_y2)}")
                 glRotatef(r_z2, 0, 0, 1); glTranslatef(c_x2, c_y2, c_z2)
                 draw_tracker_cam_pairs([pos])
                 glPopMatrix()
