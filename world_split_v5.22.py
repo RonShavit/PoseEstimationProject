@@ -773,20 +773,23 @@ FEATURE_RUN_MAX_INLIER_REPROJECTION_ERROR = 4.0
 FEATURE_PRE_RESET_DT_SECONDS = 1.5
 
 
+FEATURE_RUN_LIGHTING_ENABLED = False  # set at startup by main() when not --pre
+
+
 def apply_feature_lighting_bgr(bgr, profile):
     img = bgr.astype(np.float32)
-    if profile == FEATURE_RUN_LIGHTING:
-        img[:, :, 0] *= 1.15
-        img[:, :, 1] *= 0.86
-        img[:, :, 2] *= 0.62
-        img *= 0.72
+    if profile == FEATURE_RUN_LIGHTING and FEATURE_RUN_LIGHTING_ENABLED:
+        img[:, :, 0] *= 1.08
+        img[:, :, 1] *= 0.97
+        img[:, :, 2] *= 0.90
+        img *= 0.92
     else:
         img = img * 1.05 + 6.0
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
 def draw_feature_lighting_overlay(profile, viewport_x, viewport_y, view_w, view_h):
-    if profile != FEATURE_RUN_LIGHTING:
+    if profile != FEATURE_RUN_LIGHTING or not FEATURE_RUN_LIGHTING_ENABLED:
         return
     glViewport(viewport_x, viewport_y, view_w, view_h)
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
@@ -1676,7 +1679,7 @@ def draw(recording_mode, trackers_mode=False, feature_mode=False,
                  feature_pre_mode=feature_pre_mode,
                  motion_scale=motion_scale)
     if feature_mode:
-        draw_feature_lighting_overlay(FEATURE_PRE_LIGHTING, 0, 0, width // 2, height)
+        draw_feature_lighting_overlay(FEATURE_RUN_LIGHTING, 0, 0, width // 2, height)
     if picking_mode:
         draw_left_world_pick_markers(picked_points, pending_left_world_point)
     if feature_pre_mode:
@@ -2320,6 +2323,7 @@ def browse_feature_attempt(delta):
 # ---------------------------------------------------------------------------
 def main(argv=None):
     global CONFIG, ACTIVE_MAP
+    global FEATURE_RUN_LIGHTING_ENABLED
     global c_x, c_y, c_z, r_x, r_y, r_z
     global c_x2, c_y2, c_z2, r_x2, r_y2, r_z2
     global saved_positions, recording_index, recording_mode
@@ -2352,6 +2356,16 @@ def main(argv=None):
         if pre_action == "cancel":
             print("Feature Pre Mode cancelled.")
             return
+    else:
+        answer = input(
+            "Simulate different lighting during Feature Run "
+            "(PRE captures vs RUN queries look slightly different)? [y/N]: "
+        ).strip().lower()
+        FEATURE_RUN_LIGHTING_ENABLED = answer in ("y", "yes")
+        print(
+            "Feature Run lighting simulation: "
+            + ("ON" if FEATURE_RUN_LIGHTING_ENABLED else "OFF (PRE/RUN captures identical)")
+        )
 
     color_summary = ACTIVE_MAP["color_path"] or "height-map colors"
     print(

@@ -12,3 +12,4 @@ screenshot.png
 auto_map.py
 dedupe_database.py
 prune_sparse_views.py
+feature_dbs/**/backups/

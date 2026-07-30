@@ -98,6 +98,10 @@ class FeatureDatabase:
         self.metadata = dict(metadata)
         self.views = list(views or [])
         self.mappings = list(mappings or [])
+        self._mapping_index = {
+            (m["view_id"], int(m["keypoint_id"])) for m in self.mappings
+        }
+        self._view_index = {v.view_id: v for v in self.views}
 
     @classmethod
     def empty(cls, map_profile, map_shape, view_size):
@@ -156,14 +160,12 @@ class FeatureDatabase:
             descriptors=descriptors,
         )
         self.views.append(view)
+        self._view_index[view.view_id] = view
         self.touch()
         return view
 
     def mapping_exists(self, view_id, keypoint_id):
-        return any(
-            m["view_id"] == view_id and int(m["keypoint_id"]) == int(keypoint_id)
-            for m in self.mappings
-        )
+        return (view_id, int(keypoint_id)) in self._mapping_index
 
     def add_mapping(self, view_id, keypoint_id, world_point):
         view = self.get_view(view_id)
@@ -184,6 +186,7 @@ class FeatureDatabase:
             "created_at": utc_timestamp(),
         }
         self.mappings.append(mapping)
+        self._mapping_index.add((view_id, keypoint_id))
         self.touch()
         return mapping
 
@@ -206,6 +209,7 @@ class FeatureDatabase:
             "created_at": utc_timestamp(),
         }
         self.mappings.append(mapping)
+        self._mapping_index.add((view_id, -1))
         self.touch()
         return mapping
 
@@ -226,23 +230,32 @@ class FeatureDatabase:
                 if (item["point_id"] == target_point_id
                         and item["view_id"] == mapping["view_id"]
                         and int(item["keypoint_id"]) == int(mapping["keypoint_id"])):
+                    key = (item["view_id"], int(item["keypoint_id"]))
                     del self.mappings[index]
+                    if not any(
+                        m["view_id"] == key[0] and int(m["keypoint_id"]) == key[1]
+                        for m in self.mappings
+                    ):
+                        self._mapping_index.discard(key)
                     self.touch()
                     return True
                 continue
             if (item["view_id"] == mapping["view_id"]
                     and int(item["keypoint_id"]) == int(mapping["keypoint_id"])
                     and tuple(item["world_point"]) == tuple(mapping["world_point"])):
+                key = (item["view_id"], int(item["keypoint_id"]))
                 del self.mappings[index]
+                if not any(
+                    m["view_id"] == key[0] and int(m["keypoint_id"]) == key[1]
+                    for m in self.mappings
+                ):
+                    self._mapping_index.discard(key)
                 self.touch()
                 return True
         return False
 
     def get_view(self, view_id):
-        for view in self.views:
-            if view.view_id == view_id:
-                return view
-        return None
+        return self._view_index.get(view_id)
 
     def mapped_keypoint_ids(self, view_id):
         return {
@@ -328,18 +341,34 @@ class FeatureDatabase:
             # won't have it, so fall back to one independent point_id per mapping
             # (which is correct for legacy data anyway, since it predates variants).
             has_point_ids = "mapping_point_ids" in data.files
+            # IMPORTANT: each data["key"] access on a compressed .npz lazily
+            # re-decompresses that entire array from scratch -- it is NOT
+            # cached across repeated accesses. Pulling each array out ONCE
+            # here (instead of indexing data["key"][i] inside the per-row
+            # loop below) turns what was an O(N^2) full-array decompression
+            # into a single O(N) decompression per array. At a few thousand
+            # mappings this difference is minutes vs. milliseconds, and the
+            # repeated large allocate/discard churn from the O(N^2) version
+            # is exactly the kind of pattern that fragments memory and can
+            # eventually make even a small later allocation fail.
+            mapping_view_ids = data["mapping_view_ids"]
             mapping_point_ids = data["mapping_point_ids"] if has_point_ids else None
+            mapping_keypoint_ids = data["mapping_keypoint_ids"]
+            mapping_keypoints = data["mapping_keypoints"]
+            mapping_descriptors = data["mapping_descriptors"]
+            mapping_world_points = data["mapping_world_points"]
+            mapping_created_at = data["mapping_created_at"]
             mappings = []
-            for i, view_id in enumerate(data["mapping_view_ids"]):
+            for i, view_id in enumerate(mapping_view_ids):
                 mappings.append({
                     "point_id": (str(mapping_point_ids[i]) if has_point_ids
                                  else f"legacy_{i}"),
                     "view_id": str(view_id),
-                    "keypoint_id": int(data["mapping_keypoint_ids"][i]),
-                    "keypoint": tuple(float(v) for v in data["mapping_keypoints"][i]),
-                    "descriptor": np.asarray(data["mapping_descriptors"][i], dtype=np.float32),
-                    "world_point": tuple(float(v) for v in data["mapping_world_points"][i]),
-                    "created_at": str(data["mapping_created_at"][i]),
+                    "keypoint_id": int(mapping_keypoint_ids[i]),
+                    "keypoint": tuple(float(v) for v in mapping_keypoints[i]),
+                    "descriptor": np.asarray(mapping_descriptors[i], dtype=np.float32),
+                    "world_point": tuple(float(v) for v in mapping_world_points[i]),
+                    "created_at": str(mapping_created_at[i]),
                 })
             return cls(metadata, views, mappings)
 
