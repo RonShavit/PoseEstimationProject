@@ -9,3 +9,6 @@ screenshot.png
 # if we want to let git track those 2 screenshots again,
 # we remove those 2 lines from here(.gitignore) and
 # write in terminal: git add screenshot_feature.png screenshot.png
+auto_map.py
+dedupe_database.py
+prune_sparse_views.py
