@@ -29,8 +29,8 @@ MAP_PROFILES = {
     "map_1": {
         "height_path": os.path.join("maps", "map_1.png"),
         "color_path": os.path.join("colors", "col_1.png"),
-        "margin": 8,
-        "map_scale": 14.0,
+        "margin": 1,
+        "map_scale": 100.0,
         "blur_sigma": 3.0,
     },
     "map_2": {
@@ -43,7 +43,7 @@ MAP_PROFILES = {
     "map_3": {
         "height_path": os.path.join("maps", "map_3.jpg"),
         "color_path": os.path.join("colors", "col_3.png"),
-        "margin": 10,
+        "margin": 8,
         "map_scale": 15.0,
         "blur_sigma": 4.0,
     },
@@ -217,6 +217,19 @@ def build_pyramid_vbo():
 
 def draw_pyramid_vbo(vbo, vertex_count, tint):
     """Draw one pyramid (O(1), local-space geometry) with the given RGB tint."""
+    # A solid multi-face shape needs depth testing (or face culling) to
+    # resolve which faces are in front -- without it, triangles just paint
+    # over each other in submission order, which makes the pyramid look
+    # inside-out/inverted. Some callers (e.g. Feature Run's overview
+    # annotations) intentionally disable depth testing so path lines and
+    # markers stay visible through the terrain; that's fine for those flat
+    # primitives but breaks a solid pyramid's self-occlusion. Force it on
+    # just for the pyramid's own faces, then restore whatever the caller had.
+    depth_was_enabled = bool(glIsEnabled(GL_DEPTH_TEST))
+    old_depth_mask = bool(np.asarray(glGetBooleanv(GL_DEPTH_WRITEMASK)).item())
+    glEnable(GL_DEPTH_TEST)
+    glDepthMask(GL_TRUE)
+
     glBindBuffer(GL_ARRAY_BUFFER, vbo)
     glEnableClientState(GL_COLOR_ARRAY)
     glEnableClientState(GL_VERTEX_ARRAY)
@@ -240,6 +253,10 @@ def draw_pyramid_vbo(vbo, vertex_count, tint):
         glVertex3fv(bv)
     glEnd()
     glDisableClientState(GL_VERTEX_ARRAY)
+
+    glDepthMask(GL_TRUE if old_depth_mask else GL_FALSE)
+    if not depth_was_enabled:
+        glDisable(GL_DEPTH_TEST)
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1202,8 @@ def draw_2d_pick_marker(point, color, size=7):
     glVertex2f(x, y - size)
     glVertex2f(x, y + size)
     glEnd()
+    global tracker_overlay_active
+    tracker_overlay_active = False  # disable tracker overlay while picking
 
 
 def draw_2d_pick_dot(point, color=(1.0, 0.0, 0.0), radius=5):
@@ -1197,6 +1216,8 @@ def draw_2d_pick_dot(point, color=(1.0, 0.0, 0.0), radius=5):
         glVertex2f(x + math.cos(angle) * radius,
                    y + math.sin(angle) * radius)
     glEnd()
+    global tracker_overlay_active
+    tracker_overlay_active = False  # disable tracker overlay while picking
 
 
 def draw_left_world_pick_markers(completed_points, pending_point):
@@ -1240,6 +1261,8 @@ def draw_left_world_pick_markers(completed_points, pending_point):
     glPopMatrix()
     glMatrixMode(GL_PROJECTION); glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
+    global tracker_overlay_active
+    tracker_overlay_active = False  # disable tracker overlay while picking
 
 
 def draw_right_image_points_2d(correspondences):
@@ -2842,6 +2865,7 @@ def main(argv=None):
                         if world_point is not None:
                             pending_left_world_point = world_point
                             print(f"Pending 3D point selected on left: {world_point}")
+                            tracker_overlay_active = False
                         else:
                             print("Left picking missed terrain")
                     else:
