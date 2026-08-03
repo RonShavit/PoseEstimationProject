@@ -1,4 +1,3 @@
  start_h:-50
  start_a:0
  trackers_path:trackers.trk
- feature_ref_count:100
