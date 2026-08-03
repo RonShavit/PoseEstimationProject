@@ -241,6 +241,30 @@ where a map profile is a dictionary with the following:
 | `"map_scale"` | map_scale - float |
 | `"blur_sigma"` | blur_sigma - float |  
 
-To add a new map, add a new entry to `MAP_PROFILES`.
+To add a new map, add a new entry to `MAP_PROFILES`. It will be added to all menus automaticly
 
-***NOTES
+***NOTES:***
+- If color map is of a different size than the height map, it will be automaticly resized
+- Changing any of the parameters will likley make its respective map's database to not be relevent for it
+
+
+### Editing trackers
+Trackers are defines using 6 parameters. 3 for position (*xyz*) and 3 for color (0≤*rgb*≤255). 
+A trackers file contains line where each line defines one tracker and is of format `x, y, z, r, g, b` (lines starting with "#" are ignored). 
+To use a new trackers file, open the `CONFIG` file and change the `trackers_path` line to your file's path.
+
+***Notes:***
+- Using trackers with similar colors to each other or the map might result in poor estimations
+- Using less than 4 trackers will not allow any estimation to be returned
+
+
+### Changing the starting position
+The camera will start at the facing the middle of the map (on the x axis) and 100 units back from the origin (on th z axis) with the hrizontal starting angle being 0. Two parameters are changable:
+- Starting height (on the y axis)
+- Vertical starting angle (up/down)  
+To change these parameters, open the `CONFIG` file and edit the lines `start_h` (for starting height) or `start_a` (for starting vertical angle).
+
+***NOTES:***
+- The y axis for starting height is inverted (positive is down), meaning for starting 100 units up `start_h` should be -100
+- For starting vertical angle, rotation is downward and is given in degrees (i. e. `start_a:90` will start the camera looking straight down)
+
