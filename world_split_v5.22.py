@@ -2453,7 +2453,7 @@ def main(argv=None):
     c_x2, c_y2, c_z2 = map(float, starting_pos)
     r_x = r_y = r_z = 0.0
     r_x2 = r_y2 = r_z2 = 0.0
-    r_x = r_x2 = CONFIG.get("start_a")
+    r_x = r_x2 = float(CONFIG.get("start_a"))
 
     display = (640*2, 480)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
@@ -2831,7 +2831,7 @@ def main(argv=None):
                             ih, iw, _ = image.shape
                             m = ACTIVE_MAP["margin"]
                             c_x2, c_y2, c_z2 = -iw/m/2, CONFIG.get("start_h"), -(ih/m)-100
-                            r_x2, r_y2, r_z2 = CONFIG.get("start_a"), 0.0, 0.0
+                            r_x2, r_y2, r_z2 = float(CONFIG.get("start_a")), 0.0, 0.0
                             print("Picking mode: no saved positions, right view at starting pos")
                     else:
                         if trackers_mode == False and feature_mode == False:
