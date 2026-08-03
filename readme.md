@@ -264,7 +264,7 @@ The camera will start at the facing the middle of the map (on the x axis) and 10
 - Vertical starting angle (up/down)  
 To change these parameters, open the `CONFIG` file and edit the lines `start_h` (for starting height) or `start_a` (for starting vertical angle).
 
-***NOTES:***
+***Notes:***
 - The y axis for starting height is inverted (positive is down), meaning for starting 100 units up `start_h` should be -100
 - For starting vertical angle, rotation is downward and is given in degrees (i. e. `start_a:90` will start the camera looking straight down)
 
