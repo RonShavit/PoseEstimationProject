@@ -132,7 +132,7 @@ In trackers mode colorful trackers will appear in 3D space. You may move the cam
 - Sometimes, the position/estimation of the camera may be outside of the left view camera's field of view, and as such the pyramid representing it will not appear on the right view
 - Trackers too far away from the camera might not be detected ny the algorithm
 - After pressing **b** to estimate position or **n**/**m** to view recorded position/estimation pairs, an overlay of the estimated position's view will appear over the actual view
-- By defualt, 8 trackers are included. See ***TODO*** to learn how to change the trackers
+- By defualt, 8 trackers are included. See `Editing trackers` to learn how to change the trackers
 
 
 **5. Features run mode**
@@ -161,7 +161,7 @@ In Features run mode, you may control the camera and use previously gathered dat
 ***Notes:***
 - The recorded estimation/position will appear as a square pyramid, with the base of the pyramid representing the front of the camera, and the tip of the pyramid (colored black) representing the back of it
 - Sometimes, the position/estimation of the camera may be outside of the left view camera's field of view, and as such the pyramid representing it will not appear on the right view
-- When viewing a point with little covrage in the database, the estimation may use less strict solving methods and will return a less accurate estimation. Sometimes, when there are not enough data points, no estimatio will be returned, but the real position will be recorded for reviewing purposes (see ***TODO*** to see how to gather editional data).  
+- When viewing a point with little covrage in the database, the estimation may use less strict solving methods and will return a less accurate estimation. Sometimes, when there are not enough data points, no estimatio will be returned, but the real position will be recorded for reviewing purposes (see `Gathering data` to see how to gather editional data).  
 
 ## Gathering data
 Run: `python world_split_v5.22.py --pre`  
@@ -233,13 +233,13 @@ At the top of world_split_v5.22.py there is a dictinary called `MAP_PROFILES`. E
 >value: map profile  
 
 where a map profile is a dictionary with the following:  
-| key | value |
-| -------- | ------- |
-| `"height_path"` | path to height map - string |
-| `"color_path"` | path to color map - string |
-| `"margin"` | margin - int |
-| `"map_scale"` | map_scale - float |
-| `"blur_sigma"` | blur_sigma - float |  
+| key             | value              | type   |
+| --------------- | ------------------ | -------|
+| `"height_path"` | path to height map | string |
+| `"color_path"`  | path to color map  | string |
+| `"margin"`      | margin             | int    |
+| `"map_scale"`   | map_scale          | float  |
+| `"blur_sigma"`  | blur_sigma         | float  |  
 
 To add a new map, add a new entry to `MAP_PROFILES`. It will be added to all menus automaticly
 
