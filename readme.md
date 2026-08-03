@@ -243,7 +243,7 @@ where a map profile is a dictionary with the following:
 
 To add a new map, add a new entry to `MAP_PROFILES`. It will be added to all menus automaticly
 
-***NOTES:***
+***Notes:***
 - If color map is of a different size than the height map, it will be automaticly resized
 - Changing any of the parameters will likley make its respective map's database to not be relevent for it
 
