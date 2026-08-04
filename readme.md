@@ -14,7 +14,7 @@ Clone repository from https://github.com/RonShavit/PoseEstimationProject.git
     `python3 -m venv venv`  
     `source venv/bin/activate`
 
-2. (Installing requiremnts) Run:  
+2. (Installing requirements) Run:  
     `pip install -r "requirements.txt"`
 
 ## Running the Project
