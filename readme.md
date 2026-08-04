@@ -206,7 +206,7 @@ After choosing an option from 1-3, the world will load in data gathering mode
 - **CTRL**+**S**: Save changes to database
 - **y**: Confirm save
 - **n**: Deny save
-- **U**: Undo last selection
+- **u**: Undo last selection
 - **[**: Go to previous saved viewpoint
 - **]**: Go to next saved viewpoint
 
