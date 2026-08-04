@@ -204,6 +204,8 @@ After choosing an option from 1-3, the world will load in data gathering mode
 - **Right click**: Select a feature from the ones available on the right view
 - **Left click**: Select a corresponding 3D point on the left view
 - **CTRL**+**S**: Save changes to database
+- **y**: Confirm save
+- **n**: Deny save
 - **U**: Undo last selection
 - **[**: Go to previous saved viewpoint
 - **]**: Go to next saved viewpoint
@@ -216,6 +218,7 @@ After choosing an option from 1-3, the world will load in data gathering mode
 - Using **[** / **]** allows you to switch between saved viewpoints and add features to them. If edit database is innitially selected, you may edit viewpoints from the database
 - You are required to choose a feature on the right view before selecting a corresponding 3D point on the left view
 - Only one database is nativly saved per map. You may backup a database by finding it in feature_dbs\"map name"\active_sift.npz
+- After pressing **CTRL**+**s** you must confirm saving by pressing **y** or deny by pressing **n** befor continuing
 
 ## Changing environment parameters
 ### Changing avilable maps
